@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Il parser deve leggere correttamente un transcript prodotto da Claude Code 2.1.319."""
+"""The parser must correctly read a transcript produced by Claude Code 2.1.319.
+
+The fixture is a real (Italian-language) session, kept verbatim."""
 import importlib.machinery, importlib.util, os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -12,11 +14,11 @@ meta, prompts, calls = fr.parse_transcript(os.path.join(HERE, "fixtures", "claud
 got = [(c["tool"], c["status"]) for c in calls]
 want = [("Read", "ok"), ("Edit", "ok"), ("Bash", "error"), ("Bash", "ok"), ("Edit", "error"), ("Read", "ok")]
 checks = [
-    (got == want, f"chiamate e stati: {got}"),
+    (got == want, f"calls and statuses: {got}"),
     ([p["text"] for p in prompts] == ["fai il test"], f"prompt: {[p['text'] for p in prompts]}"),
-    (calls[1]["intent"] == "Sostituisco beta con gamma.", f"intenzione dell'Edit: {calls[1]['intent']!r}"),
-    (all(c["result_ts"] and c["requested"] for c in calls), "orari di richiesta e risultato presenti"),
-    (calls[1]["tool_use_result"].get("oldString") == "beta", "toolUseResult letto"),
+    (calls[1]["intent"] == "Sostituisco beta con gamma.", f"Edit intent: {calls[1]['intent']!r}"),
+    (all(c["result_ts"] and c["requested"] for c in calls), "request and result timestamps present"),
+    (calls[1]["tool_use_result"].get("oldString") == "beta", "toolUseResult parsed"),
 ]
 ok = True
 for cond, msg in checks:

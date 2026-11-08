@@ -40,6 +40,10 @@ Records every agent action, verifies what actually changed on disk, and produces
         ⚠ app.py reverted to a previous version: undoing work from step 6
 ```
 
+The same session in `report.html`, a single offline page with findings, a filterable timeline and the real diff of every action:
+
+<img src="assets/report.png" alt="flightrec HTML report: session summary cards, actions by tool and the list of findings" width="100%">
+
 ## Why
 
 Claude Code's transcript tells you what the agent *intended* to do. Hooks tell you *when* it happened. Only the filesystem tells you what *actually happened*: a `sed -i` command inside Bash, a file created and then deleted, an Edit that reports success but changes nothing, or a modification you made between turns.

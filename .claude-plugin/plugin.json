@@ -1,7 +1,7 @@
 {
   "name": "flightrec",
   "version": "0.1.0",
-  "description": "Scatola nera per Claude Code: registra ogni azione dell'agente, ne verifica gli effetti reali sui file e produce un resoconto deterministico consultabile offline.",
+  "description": "The black box for Claude Code: records every agent action, verifies its actual effect on files, and produces a deterministic report you can inspect offline.",
   "author": {
     "name": "christianderrico"
   },

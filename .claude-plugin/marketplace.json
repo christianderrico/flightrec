@@ -5,7 +5,7 @@
     {
       "name": "flightrec",
       "source": "./",
-      "description": "Scatola nera per Claude Code: ogni azione dell'agente, verificata sul disco, in un resoconto deterministico consultabile offline."
+      "description": "The black box for Claude Code: every agent action, verified on disk, in a deterministic report you can inspect offline."
     }
   ]
 }

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="it">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -28,7 +28,7 @@ h2{font-size:15px;margin:22px 0 8px} .sid{font:12px ui-monospace,monospace;color
 .bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--line);margin:6px 0}
 .legend{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--mute)} .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px}
 .find{display:flex;gap:10px;padding:7px 10px;border:1px solid var(--line);border-radius:7px;background:var(--panel);margin:5px 0;cursor:pointer;align-items:baseline}
-.sev{font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.03em;min-width:52px}
+.sev{font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.03em;min-width:68px}
 .sev.warn{color:var(--warn)} .sev.info{color:var(--info)} .sev.error{color:var(--err)}
 .kind{font:11.5px ui-monospace,monospace;color:var(--mute);min-width:140px}
 .filters{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 10px;position:sticky;top:0;background:var(--bg);padding:6px 0;z-index:2}
@@ -62,7 +62,7 @@ details summary{cursor:pointer;color:var(--mute);font-size:12px}
 </head>
 <body>
 <header><h1>flightrec · <span id="proj"></span></h1><span class="m" id="hm"></span></header>
-<div class="wrap"><aside id="list"></aside><main id="main"><div class="empty">Nessuna sessione.</div></main></div>
+<div class="wrap"><aside id="list"></aside><main id="main"><div class="empty">No sessions.</div></main></div>
 <script type="application/json" id="data">__FLIGHTREC_DATA__</script>
 <script>
 const D = JSON.parse(document.getElementById('data').textContent);
@@ -70,16 +70,16 @@ const $ = (t, a = {}, ...kids) => { const e = document.createElement(t);
   for (const [k, v] of Object.entries(a)) { if (k === 'class') e.className = v; else if (k === 'text') e.textContent = v;
     else if (k.startsWith('on')) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v); }
   for (const k of kids) if (k != null) e.append(k); return e; };
-const fmt = t => t ? new Date(t * 1000).toLocaleString('it-IT', {dateStyle: 'short', timeStyle: 'medium'}) : '–';
-const hm = t => t ? new Date(t * 1000).toLocaleTimeString('it-IT') : '–';
+const fmt = t => t ? new Date(t * 1000).toLocaleString(undefined, {dateStyle: 'short', timeStyle: 'medium'}) : '–';
+const hm = t => t ? new Date(t * 1000).toLocaleTimeString() : '–';
 const dur = s => s == null ? '–' : s < 1 ? (s * 1000).toFixed(0) + ' ms' : s < 60 ? s.toFixed(1) + ' s' : s < 3600 ? (s / 60).toFixed(1) + ' min' : (s / 3600).toFixed(1) + ' h';
 const ICON = {ok: '✓', error: '✗', denied: '⊘', interrupted: '■', no_result: '?'};
-const STL = {ok: 'riuscito', error: 'errore', denied: 'negato', interrupted: 'interrotto', no_result: 'senza risultato'};
+const STL = {ok: 'succeeded', error: 'error', denied: 'denied', interrupted: 'interrupted', no_result: 'no result'};
 const COLORS = ['#2f5bd3', '#1f7a4d', '#b26a00', '#8a3ffc', '#c2362b', '#0f7c8c', '#7a5c2e', '#d12771', '#5a6b7b', '#9aa52e'];
-const n = x => (x || 0).toLocaleString('it-IT');
+const n = x => (x || 0).toLocaleString();
 
 document.getElementById('proj').textContent = D.project.split('/').pop();
-document.getElementById('hm').textContent = `${D.project} · ${D.sessions.length} sessioni · generato ${D.generated} · v${D.version}`;
+document.getElementById('hm').textContent = `${D.project} · ${D.sessions.length} session${D.sessions.length === 1 ? '' : 's'} · generated ${D.generated} · v${D.version}`;
 
 function diffPre(text) {
   const pre = $('pre');
@@ -97,8 +97,8 @@ function list() {
     const st = s.stats, f = s.findings.filter(x => x.severity !== 'info').length;
     L.append($('div', {class: 'sess', 'data-i': i, onclick: () => show(i)},
       $('div', {class: 'd', text: fmt(st.start)}),
-      $('div', {class: 's', text: `${st.prompts} prompt · ${st.calls} azioni · ${st.errors} errori · ${f} avvisi${st.recorded ? '' : ' · solo transcript'}`}),
-      $('div', {class: 'p', text: s.prompts[0] ? s.prompts[0].text : '(nessun prompt)'})));
+      $('div', {class: 's', text: `${st.prompts} prompts · ${st.calls} actions · ${st.errors} errors · ${f} warnings${st.recorded ? '' : ' · transcript only'}`}),
+      $('div', {class: 'p', text: s.prompts[0] ? s.prompts[0].text : '(no prompt)'})));
   });
 }
 
@@ -106,19 +106,19 @@ function show(i) {
   document.querySelectorAll('.sess').forEach(e => e.classList.toggle('on', +e.dataset.i === i));
   const s = D.sessions[i], st = s.stats, M = document.getElementById('main'); M.innerHTML = '';
   location.hash = s.id;
-  M.append($('div', {class: 'sid', text: `sessione ${s.id}` + (s.transcript ? ` · ${s.transcript}` : '')}));
+  M.append($('div', {class: 'sid', text: `session ${s.id}` + (s.transcript ? ` · ${s.transcript}` : '')}));
   const tok = st.tokens || {};
-  const cards = [[dur(st.duration), 'durata'], [st.prompts, 'prompt'], [st.calls, 'azioni'], [st.errors, 'errori'],
-    [st.files_changed, 'file modificati'], [`+${n(st.lines_add)} −${n(st.lines_del)}`, 'righe'],
-    [st.external_files, 'file cambiati da altri'], [dur(st.tool_time), 'tempo nei tool'],
-    [n(tok.tokens_out), 'token in uscita'], [`${st.verified_calls}/${st.calls}`, 'azioni verificate su disco']];
+  const cards = [[dur(st.duration), 'duration'], [st.prompts, 'prompts'], [st.calls, 'actions'], [st.errors, 'errors'],
+    [st.files_changed, 'files changed'], [`+${n(st.lines_add)} −${n(st.lines_del)}`, 'lines'],
+    [st.external_files, 'files changed by others'], [dur(st.tool_time), 'time in tools'],
+    [n(tok.tokens_out), 'output tokens'], [`${st.verified_calls}/${st.calls}`, 'actions verified on disk']];
   M.append($('div', {class: 'cards'}, ...cards.map(([v, l]) => $('div', {class: 'card'}, $('div', {class: 'v', text: String(v)}), $('div', {class: 'l', text: l})))));
-  if (!st.recorded) M.append($('p', {class: 'note', text: 'Questa sessione non è stata registrata da flightrec: gli effetti sui file sono quelli dichiarati nel transcript, non verificati sul disco.'}));
+  if (!st.recorded) M.append($('p', {class: 'note', text: 'This session was not recorded by flightrec: file changes are those declared in the transcript, not verified on disk.'}));
 
-  // distribuzione dei tool
+  // tool distribution
   const tools = Object.entries(st.by_tool || {}), tot = tools.reduce((a, [, v]) => a + v, 0) || 1;
   if (tools.length) {
-    M.append($('h2', {text: 'Azioni per tool'}));
+    M.append($('h2', {text: 'Actions by tool'}));
     const bar = $('div', {class: 'bar'}), leg = $('div', {class: 'legend'});
     tools.forEach(([k, v], j) => { const c = COLORS[j % COLORS.length];
       bar.append($('div', {style: `width:${v / tot * 100}%;background:${c}`, title: `${k}: ${v}`}));
@@ -126,25 +126,25 @@ function show(i) {
     M.append(bar, leg);
   }
 
-  // segnalazioni
+  // findings
   const F = s.findings;
-  M.append($('h2', {text: `Segnalazioni (${F.length})`}));
-  if (!F.length) M.append($('p', {class: 'note', text: 'Nessuna.'}));
+  M.append($('h2', {text: `Findings (${F.length})`}));
+  if (!F.length) M.append($('p', {class: 'note', text: 'None.'}));
   for (const f of F) M.append($('div', {class: 'find', onclick: () => f.call && openCall(f.call)},
-    $('span', {class: 'sev ' + f.severity, text: f.severity === 'warn' ? 'avviso' : 'info'}),
+    $('span', {class: 'sev ' + f.severity, text: f.severity === 'warn' ? 'warning' : 'info'}),
     $('span', {class: 'kind', text: f.kind}), $('span', {text: f.message})));
 
-  // cronologia
-  M.append($('h2', {text: 'Cronologia'}));
-  const tsel = $('select', {}, $('option', {value: '', text: 'tutti i tool'}), ...Object.keys(st.by_tool || {}).map(t => $('option', {value: t, text: t})));
-  const ssel = $('select', {}, ...[['', 'tutte le azioni'], ['err', 'solo errori'], ['fs', 'che hanno cambiato file'], ['flag', 'con segnalazioni']].map(([v, t]) => $('option', {value: v, text: t})));
-  const q = $('input', {placeholder: 'cerca in input, risultati, ragionamento…', size: 34});
-  M.append($('div', {class: 'filters'}, tsel, ssel, q, $('button', {text: 'apri tutto', onclick: () => document.querySelectorAll('.call').forEach(c => c.classList.add('open'))}),
-    $('button', {text: 'chiudi tutto', onclick: () => document.querySelectorAll('.call').forEach(c => c.classList.remove('open'))})));
+  // timeline
+  M.append($('h2', {text: 'Timeline'}));
+  const tsel = $('select', {}, $('option', {value: '', text: 'all tools'}), ...Object.keys(st.by_tool || {}).map(t => $('option', {value: t, text: t})));
+  const ssel = $('select', {}, ...[['', 'all actions'], ['err', 'errors only'], ['fs', 'changed files'], ['flag', 'with findings']].map(([v, t]) => $('option', {value: v, text: t})));
+  const q = $('input', {placeholder: 'search input, results, reasoning…', size: 34});
+  M.append($('div', {class: 'filters'}, tsel, ssel, q, $('button', {text: 'expand all', onclick: () => document.querySelectorAll('.call').forEach(c => c.classList.add('open'))}),
+    $('button', {text: 'collapse all', onclick: () => document.querySelectorAll('.call').forEach(c => c.classList.remove('open'))})));
   const TL = $('div'); M.append(TL);
   const fby = {}; for (const f of F) if (f.call) (fby[f.call] = fby[f.call] || []).push(f);
 
-  // elementi in ordine di tempo: prompt, chiamate, modifiche esterne
+  // items in time order: prompts, calls, external changes
   const items = [];
   s.prompts.forEach((p, j) => items.push({t: p.ts || 0, k: 'p', p, j}));
   s.calls.forEach(c => items.push({t: c.t || 0, k: 'c', c}));
@@ -172,8 +172,8 @@ function show(i) {
 
 function callEl(c, fl) {
   const chips = $('div', {class: 'chips'});
-  if (c.agent) chips.append($('span', {class: 'chip ag', text: 'subagente ' + c.agent.slice(0, 8)}));
-  for (const ch of c.fs) chips.append($('span', {class: 'chip' + (c.verified ? '' : ' uv'), title: c.verified ? 'verificato sul disco' : 'dichiarato nel transcript, non verificato',
+  if (c.agent) chips.append($('span', {class: 'chip ag', text: 'subagent ' + c.agent.slice(0, 8)}));
+  for (const ch of c.fs) chips.append($('span', {class: 'chip' + (c.verified ? '' : ' uv'), title: c.verified ? 'verified on disk' : 'declared in the transcript, not verified',
     text: `${ch.status} ${ch.path} +${ch.add}/−${ch.del}`}));
   for (const f of fl) chips.append($('span', {class: 'chip f', text: f.kind}));
   const row = $('div', {class: 'row', onclick: () => el.classList.toggle('open')},
@@ -182,15 +182,15 @@ function callEl(c, fl) {
     $('span', {class: 'tool', text: c.tool}), $('span', {class: 'short', text: c.short}));
   if (chips.childNodes.length) row.append(chips);
   const det = $('div', {class: 'det'});
-  if (c.intent) det.append($('h4', {text: 'Cosa ha detto prima'}), $('pre', {text: c.intent}));
-  if (c.thinking) det.append($('details', {}, $('summary', {text: 'ragionamento'}), $('pre', {text: c.thinking})));
+  if (c.intent) det.append($('h4', {text: 'What Claude said before'}), $('pre', {text: c.intent}));
+  if (c.thinking) det.append($('details', {}, $('summary', {text: 'reasoning'}), $('pre', {text: c.thinking})));
   det.append($('h4', {text: `Input · ${c.id}`}), $('pre', {text: c.input}));
-  det.append($('h4', {text: 'Risultato · ' + (STL[c.status] || c.status)}), $('pre', {text: c.result == null ? '(nessun risultato)' : c.result || '(vuoto)'}));
+  det.append($('h4', {text: 'Result · ' + (STL[c.status] || c.status)}), $('pre', {text: c.result == null ? '(no result)' : c.result || '(empty)'}));
   for (const f of fl) det.append($('p', {class: 'note', text: '⚠ ' + f.message}));
-  if (c.conc && c.conc.length) det.append($('p', {class: 'note', text: `In parallelo con: ${c.conc.join(', ')}. Le modifiche ai file nello stesso intervallo sono attribuite a entrambe.`}));
-  if (c.diff) det.append($('h4', {text: 'Effetto reale sui file (diff)'}), diffPre(c.diff));
-  else if (c.fs.length && !c.verified) det.append($('p', {class: 'note', text: 'Effetto dichiarato nel transcript; nessuna foto del disco per verificarlo.'}));
-  else if (c.verified) det.append($('p', {class: 'note', text: 'Verificato: nessun file cambiato sul disco.'}));
+  if (c.conc && c.conc.length) det.append($('p', {class: 'note', text: `In parallel with: ${c.conc.join(', ')}. File changes in the same time window are attributed to all of them.`}));
+  if (c.diff) det.append($('h4', {text: 'Actual effect on files (diff)'}), diffPre(c.diff));
+  else if (c.fs.length && !c.verified) det.append($('p', {class: 'note', text: 'Effect declared in the transcript; no disk snapshot to verify it.'}));
+  else if (c.verified) det.append($('p', {class: 'note', text: 'Verified: no files changed on disk.'}));
   const el = $('div', {class: 'call' + (fl.some(f => f.severity !== 'info') ? ' flag' : ''), id: 'c-' + c.id}, row, det);
   return el;
 }
@@ -199,7 +199,7 @@ function extEl(x) {
   const det = $('div', {class: 'det'}); if (x.diff) det.append(diffPre(x.diff));
   const el = $('div', {class: 'ext'}, $('div', {class: 'row', onclick: () => el.classList.toggle('open')},
     $('span', {class: 'st', text: '✎'}), $('span', {class: 'num', text: ''}), $('span', {class: 'num', text: hm(x.to)}),
-    $('span', {text: `Modifiche fuori da Claude (tu o un altro processo): ${x.changes.map(c => `${c.path} +${c.add}/−${c.del}`).join(', ')}`})), det);
+    $('span', {text: `Changes outside Claude (by you or another process): ${x.changes.map(c => `${c.path} +${c.add}/−${c.del}`).join(', ')}`})), det);
   el.classList.add('call'); return el;
 }
 

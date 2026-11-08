@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# flightrec recorder: chiamato da Claude Code per ogni evento (hook).
+# flightrec recorder: called by Claude Code for every event (hook).
 #
-#  - accoda l'evento completo a .claude/flightrec/events.jsonl
-#  - per gli eventi che possono cambiare file, fotografa il progetto in un
-#    repository git separato (.claude/flightrec/snapshots.git) e annota l'albero
-#  - a fine turno/sessione archivia il transcript (sopravvive alla pulizia dei 30 giorni)
+#  - appends the full event to .claude/flightrec/events.jsonl
+#  - for events that can change files, snapshots the project into a separate
+#    Git repository (.claude/flightrec/snapshots.git) and records the tree
+#  - at the end of each turn/session, archives the transcript (survives the 30-day cleanup)
 #
-# Non blocca mai Claude: qualunque errore viene ignorato ed esce con 0.
-# Variabili: FLIGHTREC_DISABLE=1, FLIGHTREC_SNAPSHOT=0, FLIGHTREC_DIR=<cartella>,
-#            FLIGHTREC_KEEP_READ_OUTPUT=1 (salva anche l'output dei tool di sola lettura)
+# Never blocks Claude: any error is ignored and the script exits with 0.
+# Variables: FLIGHTREC_DISABLE=1, FLIGHTREC_SNAPSHOT=0, FLIGHTREC_DIR=<directory>,
+#            FLIGHTREC_KEEP_READ_OUTPUT=1 (also store the output of read-only tools)
 
 [ "${FLIGHTREC_DISABLE:-0}" = 1 ] && exit 0
 command -v jq >/dev/null 2>&1 || exit 0
@@ -16,8 +16,8 @@ command -v jq >/dev/null 2>&1 || exit 0
 IN=$(cat) || exit 0
 [ -n "$IN" ] || exit 0
 
-# una sola chiamata a jq: evento, tool, cwd, transcript, ora di arrivo (con frazioni di secondo)
-# separatore \x1f: con il tab, read fonderebbe i campi vuoti consecutivi
+# a single jq call: event, tool, cwd, transcript, arrival time (with fractional seconds)
+# \x1f separator: with tabs, read would merge consecutive empty fields
 IFS=$'\x1f' read -r EVENT TOOL CWD TPATH ATPATH TS < <(
   printf '%s' "$IN" | jq -r '[.hook_event_name//"", .tool_name//"", .cwd//"",
      .transcript_path//"", .agent_transcript_path//"", (now|tostring)]
@@ -30,7 +30,7 @@ ROOT="${CLAUDE_PROJECT_DIR:-$CWD}"
 DIR="${FLIGHTREC_DIR:-$ROOT/.claude/flightrec}"
 mkdir -p "$DIR" 2>/dev/null || exit 0
 
-# Tool che non modificano file: nessuna foto (sono i più frequenti, così il hook resta leggero)
+# Tools that do not modify files: no snapshot (they are the most frequent, so the hook stays light)
 READONLY='^(Read|Grep|Glob|LS|WebFetch|WebSearch|TodoWrite|TodoRead|ToolSearch|AskUserQuestion|ExitPlanMode|EnterPlanMode|TaskGet|TaskList|TaskCreate|TaskUpdate|TaskOutput|BashOutput|ListMcpResourcesTool|ReadMcpResourceTool)$'
 
 SNAP=0
@@ -40,20 +40,20 @@ case "$EVENT" in
 esac
 [ "${FLIGHTREC_SNAPSHOT:-1}" = 0 ] && SNAP=0
 
-# --- lock: le chiamate ai tool possono essere parallele ---------------------------------
+# --- lock: tool calls can run in parallel ---------------------------------------------
 LOCK="$DIR/.lock"
 if command -v flock >/dev/null 2>&1; then
   exec 9>"$LOCK" && flock -w 20 9
 else
   for _ in $(seq 1 400); do
     if mkdir "$LOCK.d" 2>/dev/null; then trap 'rmdir "$LOCK.d" 2>/dev/null' EXIT; break; fi
-    # lock orfano (processo ucciso): più vecchio di 60 s
+    # orphaned lock (killed process): older than 60 s
     if [ -n "$(find "$LOCK.d" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then rmdir "$LOCK.d" 2>/dev/null; fi
     sleep 0.05
   done
 fi
 
-# --- foto del progetto -------------------------------------------------------------------
+# --- project snapshot -------------------------------------------------------------------
 TREE=""
 if [ "$SNAP" = 1 ] && command -v git >/dev/null 2>&1; then
   G="$DIR/snapshots.git"
@@ -61,11 +61,11 @@ if [ "$SNAP" = 1 ] && command -v git >/dev/null 2>&1; then
     git init -q --bare "$G" >/dev/null 2>&1
     mkdir -p "$G/info"
   fi
-  # esclusioni: .gitignore del progetto (automatico) + cartelle pesanti + .flightrecignore
+  # exclusions: project .gitignore (automatic) + heavy directories + .flightrecignore
   EXC="$G/info/exclude"
   if ! grep -q '^# flightrec' "$EXC" 2>/dev/null || { [ -f "$ROOT/.flightrecignore" ] && [ "$ROOT/.flightrecignore" -nt "$EXC" ]; }; then
     {
-      printf '# flightrec (rigenerato automaticamente)\n/%s/\n' "${DIR#"$ROOT"/}"
+      printf '# flightrec (regenerated automatically)\n/%s/\n' "${DIR#"$ROOT"/}"
       printf '%s\n' node_modules/ .venv/ venv/ __pycache__/ .mypy_cache/ .pytest_cache/ .next/ .nuxt/ \
         .gradle/ .terraform/ .DS_Store '*.pyc'
       [ -f "$ROOT/.flightrecignore" ] && cat "$ROOT/.flightrecignore"
@@ -77,7 +77,7 @@ if [ "$SNAP" = 1 ] && command -v git >/dev/null 2>&1; then
            GIT_COMMITTER_NAME=flightrec GIT_COMMITTER_EMAIL=flightrec@localhost
     cd "$ROOT" 2>/dev/null || exit 0
     git -c core.autocrlf=false -c core.safecrlf=false add -A . >/dev/null 2>&1
-    # .flightrecinclude: file ignorati dal .gitignore da fotografare comunque (es. .env, file generati)
+    # .flightrecinclude: files ignored by .gitignore to snapshot anyway (e.g. .env, generated files)
     if [ -f "$ROOT/.flightrecinclude" ]; then
       while IFS= read -r pat || [ -n "$pat" ]; do
         pat="${pat%$'\r'}"
@@ -87,7 +87,7 @@ if [ "$SNAP" = 1 ] && command -v git >/dev/null 2>&1; then
       done < "$ROOT/.flightrecinclude"
     fi
     t=$(git write-tree 2>/dev/null) || exit 0
-    # tiene gli oggetti raggiungibili (un commit solo quando l'albero cambia)
+    # keep objects reachable (a commit only when the tree changes)
     prev=$(git rev-parse -q --verify refs/flightrec/snapshots 2>/dev/null)
     if [ -z "$prev" ] || [ "$(git rev-parse "$prev^{tree}" 2>/dev/null)" != "$t" ]; then
       c=$(printf '%s %s\n' "$EVENT" "$TOOL" | git commit-tree "$t" ${prev:+-p "$prev"} 2>/dev/null) \
@@ -98,17 +98,17 @@ if [ "$SNAP" = 1 ] && command -v git >/dev/null 2>&1; then
   )
 fi
 
-# --- evento ------------------------------------------------------------------------------
+# --- event -------------------------------------------------------------------------------
 KEEP=0
 [[ "$TOOL" =~ $READONLY ]] && [ "${FLIGHTREC_KEEP_READ_OUTPUT:-0}" != 1 ] && KEEP=1
 printf '%s' "$IN" | jq -c --arg ts "$TS" --arg tree "$TREE" --argjson drop "$KEEP" '
   {v: 1, ts: ($ts|tonumber), event: .hook_event_name, session: .session_id,
    agent: (.agent_id // null), tool: (.tool_name // null), id: (.tool_use_id // null),
    tree: (if $tree == "" then null else $tree end),
-   payload: (if $drop == 1 and has("tool_response") then (.tool_response = "[omesso: tool di sola lettura, vedi transcript]") else . end)}
+   payload: (if $drop == 1 and has("tool_response") then (.tool_response = "[omitted: read-only tool, see transcript]") else . end)}
 ' >> "$DIR/events.jsonl" 2>/dev/null
 
-# --- archivio dei transcript -------------------------------------------------------------
+# --- transcript archive ----------------------------------------------------------------
 case "$EVENT" in
   Stop|SessionEnd|SubagentStop|PreCompact)
     mkdir -p "$DIR/transcripts" 2>/dev/null

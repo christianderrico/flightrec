@@ -1,5 +1,5 @@
 {
-  "description": "flightrec: registra ogni azione di Claude Code e i suoi effetti sui file",
+  "description": "flightrec: records every Claude Code action and its effects on files",
   "hooks": {
     "PreToolUse": [
       {

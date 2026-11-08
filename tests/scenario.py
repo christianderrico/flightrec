@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Test end-to-end di flightrec.
+"""flightrec end-to-end test.
 
-Simula una sessione di Claude Code: per ogni azione chiama il vero hooks/record.sh
-con i payload documentati, esegue davvero l'effetto sui file e scrive il transcript
-nello stesso formato di Claude Code. Poi esegue l'analizzatore e controlla le segnalazioni.
+Simulates a Claude Code session: for every action it calls the real hooks/record.sh
+with the documented payloads, actually performs the effect on files and writes the
+transcript in Claude Code's format. Then it runs the analyzer and checks the findings.
 """
 import json, os, shutil, subprocess, sys, tempfile, time, uuid
 
@@ -23,7 +23,7 @@ class Session:
         self.parent = None
         self.n = 0
 
-    # ---- transcript (formato di Claude Code) ----
+    # ---- transcript (Claude Code format) ----
     def _line(self, typ, content, **extra):
         u = str(uuid.uuid4())
         ln = {"parentUuid": self.parent, "isSidechain": False, "userType": "external", "cwd": self.proj,
@@ -41,7 +41,7 @@ class Session:
         env = dict(os.environ, CLAUDE_PROJECT_DIR=self.proj)
         r = subprocess.run([RECORD], input=json.dumps(p).encode(), env=env, capture_output=True, timeout=30)
         assert r.returncode == 0, r.stderr
-        assert r.stdout == b"", "il hook non deve scrivere su stdout"
+        assert r.stdout == b"", "the hook must not write to stdout"
 
     def prompt(self, text):
         self.hook("UserPromptSubmit", prompt=text)
@@ -54,7 +54,7 @@ class Session:
                                  "usage": {"input_tokens": 100, "output_tokens": 20}})
 
     def tool(self, name, inp, effect=None, result="ok", error=False, parallel=False):
-        """Esegue un'azione completa (o restituisce le funzioni per farlo in parallelo)."""
+        """Run a complete action (or return the functions to run it in parallel)."""
         self.n += 1
         tid = "toolu_%02d_%s" % (self.n, uuid.uuid4().hex[:6])
         self._line("assistant", {"id": "msg_" + uuid.uuid4().hex[:8], "type": "message", "role": "assistant",
@@ -111,42 +111,42 @@ def main():
         W(f"{proj}/config.toml", "debug = false\n")
         W(f"{proj}/.gitignore", "secret.env\nlocal.env\n_cc_home/\n")
         W(f"{proj}/secret.env", "TOKEN=xyz\n")
-        # local.env è ignorato da git ma incluso esplicitamente nelle foto
+        # local.env is ignored by git but explicitly included in snapshots
         W(f"{proj}/local.env", "PORT=1\n")
-        W(f"{proj}/.flightrecinclude", "# file ignorati da fotografare comunque\nlocal.env\n")
+        W(f"{proj}/.flightrecinclude", "# ignored files to snapshot anyway\nlocal.env\n")
         s = Session(proj)
         s.hook("SessionStart", source="startup")
         P = lambda *a: os.path.join(proj, *a)
 
-        s.prompt("Rinomina beta in gamma e sistema il progetto")
-        s.say("Leggo il file per capire il contenuto.")
+        s.prompt("Rename beta to gamma and clean up the project")
+        s.say("Reading the file to understand its content.")
         s.tool("Read", {"file_path": P("notes.txt")}, result="1\talpha\n2\tbeta\n")
-        s.say("Sostituisco beta con gamma.")
+        s.say("Replacing beta with gamma.")
         s.tool("Edit", {"file_path": P("notes.txt"), "old_string": "beta", "new_string": "gamma"},
                effect=lambda: W(P("notes.txt"), "alpha\ngamma\n"), result="The file notes.txt has been updated successfully.")
         s.tool("Bash", {"command": "cat missing_file.txt"}, result="Exit code 1\ncat: missing_file.txt: No such file or directory", error=True)
-        s.say("Creo un file via shell.")
+        s.say("Creating a file from the shell.")
         s.tool("Bash", {"command": "echo hi > made_by_bash.txt && sed -i 's/alpha/ALPHA/' notes.txt"},
                effect=sh("echo hi > made_by_bash.txt && sed -i 's/alpha/ALPHA/' notes.txt", proj), result="")
-        # Edit che dichiara successo ma non cambia nulla
+        # Edit that reports success but changes nothing
         s.tool("Edit", {"file_path": P("app.py"), "old_string": "return 1", "new_string": "return 2"}, result="updated successfully")
-        # due azioni in parallelo
-        s.say("Aggiorno app.py e creo b.txt in parallelo.")
+        # two actions in parallel
+        s.say("Updating app.py and creating b.txt in parallel.")
         a = s.tool("Edit", {"file_path": P("app.py"), "old_string": "return 1", "new_string": "return 3"},
                    effect=lambda: W(P("app.py"), "def main():\n    return 3\n"), parallel=True)
         b = s.tool("Bash", {"command": "touch b.txt"}, effect=sh("touch b.txt", proj), parallel=True)
         a[1](); b[1](); a[2](); b[2](); a[3](); b[3]()
-        s.say("Fatto.")
+        s.say("Done.")
         s.stop()
 
-        # l'utente modifica un file tra un turno e l'altro (anche un file ignorato)
-        W(P("notes.txt"), "ALPHA\ngamma\ndelta (scritto a mano)\n")
+        # the user edits files between turns (including ignored ones)
+        W(P("notes.txt"), "ALPHA\ngamma\ndelta (written by hand)\n")
         W(P("secret.env"), "TOKEN=changed\n")
         W(P("local.env"), "PORT=2\n")
 
-        s.prompt("Prova a creare tmp.txt e poi rimuovilo; aggiorna config")
-        s.tool("Write", {"file_path": P("tmp.txt"), "content": "temporaneo\n"},
-               effect=lambda: W(P("tmp.txt"), "temporaneo\n"), result="File created successfully")
+        s.prompt("Try creating tmp.txt and then remove it; update config")
+        s.tool("Write", {"file_path": P("tmp.txt"), "content": "temporary\n"},
+               effect=lambda: W(P("tmp.txt"), "temporary\n"), result="File created successfully")
         s.tool("Bash", {"command": "rm tmp.txt"}, effect=sh("rm tmp.txt", proj), result="")
         bad = {"file_path": P("config.toml"), "old_string": "debug = true", "new_string": "debug = false"}
         s.tool("Edit", bad, result="<tool_use_error>String to replace not found in file.</tool_use_error>", error=True)
@@ -155,14 +155,14 @@ def main():
             s.tool("Read", {"file_path": P("config.toml")}, result="1\tdebug = false\n")
         s.tool("Bash", {"command": "echo x >> config.toml && false"},
                effect=sh("echo x >> config.toml", proj), result="Exit code 1", error=True)
-        # modifica annullata: app.py torna com'era prima del passo parallelo
+        # reverted work: app.py goes back to how it was before the parallel step
         s.tool("Edit", {"file_path": P("app.py"), "old_string": "return 3", "new_string": "return 1"},
                effect=lambda: W(P("app.py"), "def main():\n    return 1\n"), result="updated successfully")
-        s.say("Ho finito.")
+        s.say("Finished.")
         s.stop()
         s.end()
 
-        # ---- analisi
+        # ---- analysis
         env = dict(os.environ, HOME=os.path.join(proj, "_fakehome"))
         r = subprocess.run([sys.executable, FLIGHTREC, "build", "--project", proj], capture_output=True, text=True, env=env)
         print(r.stdout, r.stderr)
@@ -170,19 +170,19 @@ def main():
         import sqlite3
         db = sqlite3.connect(os.path.join(proj, ".claude/flightrec/flightrec.db"))
         kinds = [k for (k,) in db.execute("SELECT kind FROM findings")]
-        print("segnalazioni:", sorted(set(kinds)))
+        print("findings:", sorted(set(kinds)))
         calls = db.execute("SELECT count(*), sum(fs_verified) FROM calls").fetchone()
-        print("azioni:", calls)
+        print("actions:", calls)
         expect = {"tool_error", "indirect_change", "no_effect", "shared_attribution", "external_change",
                   "reverted", "identical_retry", "repeated_read", "error_with_changes"}
         missing = expect - set(kinds)
         ext = [p for (p,) in db.execute("SELECT path FROM external_changes")]
         checks = [
-            (not missing, f"segnalazioni mancanti: {missing}"),
-            (calls[0] == 16 and calls[1] == 12, f"16 azioni, 12 verificate sul disco (le 4 Read non fanno foto): {calls}"),
-            (sorted(ext) == ["local.env", "notes.txt"], f"modifiche esterne: notes.txt e local.env (incluso da .flightrecinclude); secret.env ignorato, il recorder non fotografa sé stesso: {ext[:5]}"),
-            (os.path.exists(os.path.join(proj, ".claude/flightrec/transcripts", s.sid + ".jsonl")), "transcript archiviato nella cartella di flightrec"),
-            (kinds.count("reverted") >= 2, f"attese 2 modifiche annullate (tmp.txt, app.py): {kinds.count('reverted')}"),
+            (not missing, f"missing findings: {missing}"),
+            (calls[0] == 16 and calls[1] == 12, f"16 actions, 12 verified on disk (the 4 Reads take no snapshot): {calls}"),
+            (sorted(ext) == ["local.env", "notes.txt"], f"external changes: notes.txt and local.env (included via .flightrecinclude); secret.env ignored, the recorder does not snapshot itself: {ext[:5]}"),
+            (os.path.exists(os.path.join(proj, ".claude/flightrec/transcripts", s.sid + ".jsonl")), "transcript archived in the flightrec directory"),
+            (kinds.count("reverted") >= 2, f"expected 2 reverted changes (tmp.txt, app.py): {kinds.count('reverted')}"),
         ]
         ok = True
         for cond, msg in checks:
@@ -190,7 +190,7 @@ def main():
             ok &= cond
         subprocess.run([sys.executable, FLIGHTREC, "timeline", "--project", proj], env=env)
         if keep:
-            print("progetto di prova:", proj)
+            print("test project:", proj)
         sys.exit(0 if ok else 1)
     finally:
         if not keep:

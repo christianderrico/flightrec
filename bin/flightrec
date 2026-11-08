@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""flightrec: resoconto deterministico di cosa ha fatto Claude Code in un progetto.
+"""flightrec: a deterministic report of what Claude Code did in a project.
 
-Incrocia tre fonti, unite per session_id + tool_use_id:
-  1. transcript di Claude Code (intenzione, input, risultato di ogni tool)
-  2. eventi degli hook registrati da flightrec (orari precisi pre/post, esito)
-  3. foto del progetto in un git separato (effetto reale sui file, anche via Bash)
+Correlates three sources, joined by session_id + tool_use_id:
+  1. the Claude Code transcript (intent, input and result of every tool call)
+  2. hook events recorded by flightrec (precise pre/post timestamps, outcome)
+  3. project snapshots in a separate Git repository (actual effect on files, Bash included)
 
-Nessun LLM: ogni segnalazione viene da una regola fissa e cita le prove.
+No LLM: every finding comes from a fixed rule and cites its evidence.
 
-Uso:
-  flightrec build    [--project DIR] [--out DIR]   crea flightrec.db e report.html
-  flightrec sessions [--project DIR]               elenco sessioni
-  flightrec timeline [SESSION] [--project DIR]     cronologia nel terminale
-  flightrec diff TOOL_USE_ID [--project DIR]       diff reale prodotto da una chiamata
-  flightrec findings [--project DIR]               solo le segnalazioni
-Richiede Python 3.9+, git, bash e jq (Linux, macOS o WSL).
+Usage:
+  flightrec build    [--project DIR] [--out DIR]   create flightrec.db and report.html
+  flightrec sessions [--project DIR]               list sessions
+  flightrec timeline [SESSION] [--project DIR]     print the timeline in the terminal
+  flightrec diff TOOL_USE_ID [--project DIR]       actual diff produced by a single call
+  flightrec findings [--project DIR]               findings only
+Requires Python 3.9+, git, bash and jq (Linux, macOS or WSL).
 """
 import argparse, bisect, datetime as dt, hashlib, html, json, os, re, sqlite3, subprocess, sys
 from collections import Counter, defaultdict
@@ -26,10 +26,10 @@ READONLY = {"Read", "Grep", "Glob", "LS", "WebFetch", "WebSearch", "TodoWrite", 
             "AskUserQuestion", "ExitPlanMode", "EnterPlanMode", "TaskGet", "TaskList", "TaskCreate",
             "TaskUpdate", "TaskOutput", "BashOutput", "ListMcpResourcesTool", "ReadMcpResourceTool"}
 SLOW_SECONDS = 60
-HTML_TEXT_CAP = 60000  # caratteri per campo nel report; il db contiene tutto
+HTML_TEXT_CAP = 60000  # characters per field in the report; the database keeps everything
 
 
-# ----------------------------------------------------------------------------- utilità
+# ----------------------------------------------------------------------------- utilities
 def parse_ts(s):
     if s is None:
         return None
@@ -65,7 +65,7 @@ def read_jsonl(path):
 
 
 def block_text(content):
-    """Testo di un campo content (stringa o lista di blocchi)."""
+    """Text of a content field (string or list of blocks)."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -77,7 +77,7 @@ def block_text(content):
                 if b.get("type") == "text":
                     parts.append(b.get("text", ""))
                 elif b.get("type") == "image":
-                    parts.append("[immagine]")
+                    parts.append("[image]")
                 elif "content" in b:
                     parts.append(block_text(b["content"]))
             elif isinstance(b, str):
@@ -104,7 +104,7 @@ def rel(path, root):
         return "."
     if p.startswith(r + os.sep):
         return p[len(r) + 1:]
-    return p  # fuori dal progetto: percorso assoluto
+    return p  # outside the project: absolute path
 
 
 def short_input(name, inp, root=None):
@@ -133,7 +133,7 @@ class Snapshots:
         return r.stdout.decode("utf-8", errors="replace")
 
     def changes(self, a, b):
-        """[{path, status, old, new, add, del, binary}] tra due alberi."""
+        """[{path, status, old, new, add, del, binary}] between two trees."""
         if not (self.ok and a and b) or a == b:
             return []
         key = (a, b)
@@ -177,14 +177,14 @@ class Snapshots:
 
 # ----------------------------------------------------------------------------- transcript
 def parse_transcript(path, root, agent=None):
-    """Restituisce (meta, prompts, calls) da un transcript JSONL di Claude Code."""
+    """Return (meta, prompts, calls) from a Claude Code JSONL transcript."""
     lines = read_jsonl(path)
     meta = {"transcript": path, "session": None, "model": Counter(), "tokens_in": 0, "tokens_out": 0,
             "tokens_cache_read": 0, "tokens_cache_write": 0, "start": None, "end": None, "version": None,
             "git_branch": None, "interruptions": 0, "bad_lines": 0, "texts": 0}
     prompts, calls, by_id = [], [], {}
     seen_msgs = set()
-    intent = []  # testo/ragionamento dall'ultimo risultato
+    intent = []  # text/reasoning since the last tool result
     seq = 0
     for ln in lines:
         if "_bad_line" in ln:
@@ -269,7 +269,7 @@ def parse_transcript(path, root, agent=None):
     return meta, prompts, calls
 
 
-# ----------------------------------------------------------------------------- modello
+# ----------------------------------------------------------------------------- model
 class Project:
     def __init__(self, root, recdir=None):
         self.root = os.path.abspath(root)
@@ -279,20 +279,20 @@ class Project:
         self.sessions = {}
 
     def transcript_paths(self):
-        """session_id -> [percorso transcript principale, ...subagenti]"""
+        """session_id -> [main transcript path, ...subagents]"""
         found = {}
-        # 1) percorsi visti negli eventi
+        # 1) paths seen in the events
         for e in self.events:
             p = (e.get("payload") or {}).get("transcript_path")
             if e.get("session") and p:
                 found.setdefault(e["session"], p)
-        # 2) storico di Claude Code per questo progetto
+        # 2) Claude Code history for this project
         hist = os.path.join(os.path.expanduser("~/.claude/projects"), project_key(self.root))
         if os.path.isdir(hist):
             for f in os.listdir(hist):
                 if f.endswith(".jsonl"):
                     found.setdefault(f[:-6], os.path.join(hist, f))
-        # 3) archivio di flightrec (usato se l'originale è sparito o più corto)
+        # 3) flightrec archive (used if the original is gone or shorter)
         arch = os.path.join(self.recdir, "transcripts")
         if os.path.isdir(arch):
             for f in os.listdir(arch):
@@ -324,7 +324,7 @@ class Project:
             self.sessions[sid] = self._session(sid, paths.get(sid, []), sorted(ev_by_session.get(sid, []), key=lambda e: e.get("ts") or 0))
         return self
 
-    # -------------------------------------------------------------------- sessione
+    # -------------------------------------------------------------------- session
     def _session(self, sid, tpaths, events):
         meta, prompts, calls = ({"transcript": None, "model": Counter(), "start": None, "end": None,
                                  "interruptions": 0, "tokens_in": 0, "tokens_out": 0, "tokens_cache_read": 0,
@@ -341,7 +341,7 @@ class Project:
                 calls += c2
         by_id = {c["id"]: c for c in calls if c["id"]}
 
-        # --- eventi degli hook: pre/post per tool_use_id
+        # --- hook events: pre/post by tool_use_id
         hook = defaultdict(dict)
         snaps = []  # (ts, kind, tree, ref)
         for e in events:
@@ -349,7 +349,7 @@ class Project:
             if ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure") and tid:
                 key = "pre" if ev == "PreToolUse" else "post"
                 hook[tid][key] = e
-                if tid not in by_id:  # chiamata senza transcript (es. subagente non archiviato)
+                if tid not in by_id:  # call without a transcript (e.g. unarchived subagent)
                     p = e.get("payload") or {}
                     c = {"id": tid, "tool": e.get("tool"), "input": p.get("tool_input") or {}, "requested": ts,
                          "seq": 10 ** 6 + len(by_id), "prompt_idx": None, "agent": e.get("agent"), "intent": "",
@@ -384,7 +384,7 @@ class Project:
             c["hooked"] = bool(pre or post)
         calls.sort(key=lambda c: (c["t"], c["seq"]))
 
-        # --- concorrenza: intervalli pre/post sovrapposti
+        # --- concurrency: overlapping pre/post intervals
         iv = [(c["ts_pre"], c["ts_post"], c) for c in calls if c["ts_pre"] and c["ts_post"]]
         for c in calls:
             c["concurrent_with"] = []
@@ -393,7 +393,7 @@ class Project:
                 if b0 < a1 and a0 < b1 and (ca["tree_pre"] or cb["tree_pre"]):
                     ca["concurrent_with"].append(cb["id"]); cb["concurrent_with"].append(ca["id"])
 
-        # --- effetti reali sui file
+        # --- actual effects on files
         for c in calls:
             c["declared"] = sorted({rel(p, self.root) for p in declared_paths(c["tool"], c["input"]) if p})
             if c["tree_pre"] and c["tree_post"]:
@@ -403,7 +403,7 @@ class Project:
                 c["fs"] = fallback_changes(c, self.root)
                 c["fs_verified"] = False
 
-        # --- modifiche fatte da altri (utente, altri processi) tra un'azione e l'altra
+        # --- changes made by others (user, other processes) between actions
         external = []
         if self.snap.ok and snaps:
             open_ids = set()
@@ -448,7 +448,7 @@ def declared_paths(tool, inp):
 
 
 def fallback_changes(c, root):
-    """Senza foto: deduce dal transcript i cambiamenti dichiarati (non verificati)."""
+    """Without snapshots: infer the declared (unverified) changes from the transcript."""
     if c["status"] != "ok" or c["tool"] not in EDIT_TOOLS:
         return []
     out = []
@@ -468,7 +468,7 @@ def fallback_changes(c, root):
     return out
 
 
-# ----------------------------------------------------------------------------- regole
+# ----------------------------------------------------------------------------- rules
 def analyze(s, snap):
     F = []
 
@@ -477,105 +477,109 @@ def analyze(s, snap):
                   "t": (call or {}).get("t"), "evidence": ev})
 
     calls = s["calls"]
-    errored = {}  # hash input -> prima chiamata fallita
-    retries = {}  # hash input -> segnalazione di retry aperta
+    errored = {}  # input hash -> first failed call
+    retries = {}  # input hash -> open retry finding
     reads = defaultdict(list)
-    file_history = defaultdict(list)  # path -> [(blob_prima, blob_dopo, call)]
-    last_change = {}  # path -> t ultima modifica
+    file_history = defaultdict(list)  # path -> [(blob_before, blob_after, call)]
+    last_change = {}  # path -> time of last change
     for c in calls:
         tool, st = c["tool"], c["status"]
         h = input_hash(tool or "", c["input"])
-        # R1 errori (i tentativi identici sono raccolti in R2)
+        # R1 errors (identical retries are grouped by R2)
         if st == "error" and h not in errored:
-            add("tool_error", "warn", f"{tool} è fallito: {first_line(c['result'])}", c)
+            add("tool_error", "warn", f"{tool} failed: {first_line(c['result'])}", c)
         elif st == "denied":
-            add("denied", "info", f"{tool} non autorizzato", c)
+            add("denied", "info", f"{tool} denied", c)
         elif st == "interrupted":
-            add("interrupted", "warn", f"{tool} interrotto", c)
+            add("interrupted", "warn", f"{tool} interrupted", c)
         elif st == "no_result" and not c.get("from_hooks_only"):
-            add("no_result", "warn", f"{tool} senza risultato nel transcript (sessione interrotta?)", c)
-        # R2 tentativo identico dopo un errore; più ripetizioni = un solo "loop"
+            add("no_result", "warn", f"{tool} has no result in the transcript (session interrupted?)", c)
+        # R2 identical retry after an error; repeated retries = a single "loop"
         if h in errored:
             r = retries.get(h)
             if r is None:
                 add("identical_retry", "warn",
-                    f"{tool} ripetuto con input identico dopo un errore (passo #{errored[h]['seq']})", c,
+                    f"{tool} retried with identical input after an error (step #{errored[h]['seq']})", c,
                     previous=errored[h]["id"], repeats=[c["id"]])
                 retries[h] = F[-1]
             else:
                 r["evidence"]["repeats"].append(c["id"])
                 k = len(r["evidence"]["repeats"])
-                ok_end = "" if st == "error" else ", poi riuscito"
+                ok_end = "" if st == "error" else ", then succeeded"
                 r["kind"] = "retry_loop" if k >= 3 else "identical_retry"
-                r["message"] = (f"{tool} ripetuto {k} volte con input identico dopo un errore "
-                                f"(dal passo #{errored[h]['seq']} al #{c['seq']}{ok_end})")
+                r["message"] = (f"{tool} retried {k} times with identical input after an error "
+                                f"(steps #{errored[h]['seq']} to #{c['seq']}{ok_end})")
         if st == "error":
             errored.setdefault(h, c)
         elif h in errored:
             errored.pop(h); retries.pop(h, None)
-        # R3 riletture senza modifiche in mezzo
+        # R3 re-reads with no changes in between
         if tool == "Read" and c["declared"]:
             p = c["declared"][0]
             reads[p] = [r for r in reads[p] if r["t"] >= last_change.get(p, 0)]
             reads[p].append(c)
             if len(reads[p]) == 3:
-                add("repeated_read", "info", f"{p} letto 3 volte senza modifiche nel frattempo", c,
+                add("repeated_read", "info", f"{p} read 3 times with no changes in between", c,
                     reads=[r["id"] for r in reads[p]])
-        # R4 lento
+        # R4 slow
         if c["duration"] and c["duration"] > SLOW_SECONDS:
-            add("slow", "info", f"{tool} ha impiegato {c['duration']:.0f} s", c)
-        # effetti sui file
+            add("slow", "info", f"{tool} took {c['duration']:.0f} s", c)
+        # effects on files
         changed = {ch["path"] for ch in c["fs"]}
         for ch in c["fs"]:
             last_change[ch["path"]] = c["t"]
         if c["fs_verified"]:
-            # R5 dichiarato ma nessun effetto
+            # R5 declared but no effect
             if tool in EDIT_TOOLS and st == "ok":
                 for p in c["declared"]:
                     if p not in changed and not c["concurrent_with"]:
-                        add("no_effect", "warn", f"{tool} riuscito ma {p} non è cambiato sul disco", c, path=p)
-            # R6 file toccati non dichiarati
+                        add("no_effect", "warn", f"{tool} succeeded but {p} was not changed on disk", c, path=p)
+            # R6 undeclared files touched
             extra = sorted(changed - set(c["declared"]))
             if extra:
                 if c["concurrent_with"]:
                     add("shared_attribution", "info",
-                        f"{len(extra)} file cambiati mentre giravano chiamate parallele: attribuzione condivisa", c,
+                        f"{plural(len(extra), 'file')} changed while parallel calls were running: shared attribution", c,
                         files=extra, concurrent=c["concurrent_with"])
                 elif tool in EDIT_TOOLS:
-                    add("side_effect", "warn", f"{tool} su {', '.join(c['declared'])} ha cambiato anche: {', '.join(extra)}", c, files=extra)
+                    add("side_effect", "warn", f"{tool} on {', '.join(c['declared'])} also changed: {', '.join(extra)}", c, files=extra)
                 else:
-                    add("indirect_change", "info", f"{tool} ha modificato {len(extra)} file: {', '.join(extra[:5])}"
+                    add("indirect_change", "info", f"{tool} modified {plural(len(extra), 'file')}: {', '.join(extra[:5])}"
                         + (" …" if len(extra) > 5 else ""), c, files=extra)
-            # R7 errore ma il disco è cambiato comunque
+            # R7 error, but the disk changed anyway
             if st in ("error", "interrupted") and changed:
-                add("error_with_changes", "warn", f"{tool} risulta fallito ma ha cambiato {len(changed)} file", c, files=sorted(changed))
-            # R8 modifiche annullate (contenuto tornato a una versione precedente)
+                add("error_with_changes", "warn", f"{tool} reported failure but changed {plural(len(changed), 'file')}", c, files=sorted(changed))
+            # R8 reverted work (content back to a previous version)
             for ch in c["fs"]:
                 hist = file_history[ch["path"]]
                 earlier = {x[0] for x in hist}
                 if hist and ch["new"] in earlier and ch["new"] != ch["old"]:
                     first = next(x for x in hist if x[0] == ch["new"])
-                    what = "eliminato (era stato creato in questa sessione)" if ch["new"] == ZERO else "riportato a una versione precedente"
-                    add("reverted", "warn", f"{ch['path']} {what}: annulla il lavoro dal passo {first[2]['seq']}", c,
+                    what = "deleted (it was created in this session)" if ch["new"] == ZERO else "reverted to a previous version"
+                    add("reverted", "warn", f"{ch['path']} {what}: undoing work from step {first[2]['seq']}", c,
                         path=ch["path"], since=first[2]["id"])
                 hist.append((ch["old"], ch["new"], c))
-    # R9 modifiche esterne
+    # R9 external changes
     for x in s["external"]:
         files = [ch["path"] for ch in x["changes"]]
         F.append({"kind": "external_change", "severity": "info", "call": None, "t": x["to"],
-                  "message": f"{len(files)} file modificati fuori dalle azioni di Claude (tu o un altro processo): "
+                  "message": f"{plural(len(files), 'file')} modified outside Claude's actions (by you or another process): "
                              + ", ".join(files[:5]) + (" …" if len(files) > 5 else ""),
                   "evidence": {"files": files, "after": x["after"], "before": x["before"]}})
-    # R10 interruzioni
+    # R10 interruptions
     if s["meta"]["interruptions"]:
         F.append({"kind": "user_interrupt", "severity": "info", "call": None, "t": None,
-                  "message": f"Hai interrotto Claude {s['meta']['interruptions']} volte", "evidence": {}})
+                  "message": f"You interrupted Claude {plural(s['meta']['interruptions'], 'time')}", "evidence": {}})
     if s["calls"] and not s["recorded"]:
         F.append({"kind": "unverified", "severity": "info", "call": None, "t": None,
-                  "message": "Sessione senza registrazione flightrec: effetti sui file dedotti dal transcript, non verificati",
+                  "message": "Session not recorded by flightrec: file changes inferred from the transcript, not verified",
                   "evidence": {}})
     F.sort(key=lambda f: (f["t"] or 0))
     return F
+
+
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
 
 
 def first_line(t):
@@ -665,7 +669,7 @@ def cap(t, n=HTML_TEXT_CAP):
     if t is None:
         return None
     t = str(t)
-    return t if len(t) <= n else t[:n] + f"\n… [troncato nel report: {len(t) - n} caratteri in più, completo in flightrec.db]"
+    return t if len(t) <= n else t[:n] + f"\n… [truncated in the report: {len(t) - n} more characters, full text in flightrec.db]"
 
 
 def report_data(project):
@@ -716,20 +720,20 @@ def cmd_build(args):
     n = len(p.sessions)
     calls = sum(len(s["calls"]) for s in p.sessions.values())
     fnd = sum(len(s["findings"]) for s in p.sessions.values())
-    print(f"{n} sessioni, {calls} azioni, {fnd} segnalazioni")
+    print(f"{n} sessions, {calls} actions, {fnd} findings")
     print("report:  " + os.path.join(out, "report.html"))
-    print("dati:    " + os.path.join(out, "flightrec.db"))
+    print("data:    " + os.path.join(out, "flightrec.db"))
     if not p.events:
-        print("nota: nessun evento registrato in questo progetto; effetti sui file non verificati.")
+        print("note: no events recorded in this project; file changes are not verified.")
 
 
 def cmd_sessions(args):
     p = load(args)
     for s in sorted(p.sessions.values(), key=lambda s: s["stats"]["start"] or 0):
         st = s["stats"]
-        rec = "registrata" if s["recorded"] else "solo transcript"
-        print(f"{s['id']}  {fmt_ts(st['start'])}  {st['prompts']} prompt  {st['calls']} azioni  "
-              f"{st['errors']} errori  {st['files_changed']} file  +{st['lines_add']}/-{st['lines_del']}  [{rec}]")
+        rec = "recorded" if s["recorded"] else "transcript only"
+        print(f"{s['id']}  {fmt_ts(st['start'])}  {st['prompts']} prompts  {st['calls']} actions  "
+              f"{st['errors']} errors  {st['files_changed']} files  +{st['lines_add']}/-{st['lines_del']}  [{rec}]")
 
 
 ICON = {"ok": "✓", "error": "✗", "denied": "⊘", "interrupted": "■", "no_result": "?"}
@@ -737,11 +741,11 @@ ICON = {"ok": "✓", "error": "✗", "denied": "⊘", "interrupted": "■", "no_
 
 def pick(p, sid):
     if not p.sessions:
-        sys.exit("nessuna sessione trovata")
+        sys.exit("no sessions found")
     if sid:
         m = [s for k, s in p.sessions.items() if k.startswith(sid)]
         if not m:
-            sys.exit(f"sessione {sid} non trovata")
+            sys.exit(f"session {sid} not found")
         return m[0]
     return max(p.sessions.values(), key=lambda s: s["stats"]["start"] or 0)
 
@@ -752,13 +756,13 @@ def cmd_timeline(args):
     fby = defaultdict(list)
     for f in s["findings"]:
         fby[f["call"]].append(f)
-    print(f"sessione {s['id']}  {fmt_ts(s['stats']['start'])}")
+    print(f"session {s['id']}  {fmt_ts(s['stats']['start'])}")
     pidx = None
     ext = sorted(s["external"], key=lambda x: x["to"] or 0)
     for c in s["calls"]:
         while ext and (ext[0]["to"] or 0) <= (c["t"] or 0):
             x = ext.pop(0)
-            print(f"  ✎ {fmt_ts(x['to'])[11:]}        modificati fuori da Claude: "
+            print(f"  ✎ {fmt_ts(x['to'])[11:]}        modified outside Claude: "
                   + ", ".join(f"{ch['path']}(+{ch['add']}/-{ch['del']})" for ch in x["changes"]))
         if c["prompt_idx"] != pidx and c["prompt_idx"] is not None and c["prompt_idx"] >= 0 and c["prompt_idx"] < len(s["prompts"]):
             pidx = c["prompt_idx"]
@@ -767,7 +771,7 @@ def cmd_timeline(args):
             print("    💬 " + first_line(c["intent"]))
         dur = f"{c['duration']:.1f}s" if c["duration"] is not None else "  ?"
         fs = " ".join(f"{ch['status']}:{ch['path']}(+{ch['add']}/-{ch['del']})" for ch in c["fs"])
-        mark = "" if c["fs_verified"] or not c["fs"] else " (non verificato)"
+        mark = "" if c["fs_verified"] or not c["fs"] else " (unverified)"
         ag = f"[{c['agent'][:8]}] " if c["agent"] else ""
         print(f"  {ICON.get(c['status'], '?')} #{c['seq']:<3} {fmt_ts(c['t'])[11:]} {dur:>6} {ag}{c['tool']}: {short_input(c['tool'] or '', c['input'], p.root)[:90]}")
         if fs:
@@ -775,7 +779,7 @@ def cmd_timeline(args):
         for f in fby.get(c["id"], []):
             print(f"        ⚠ {f['message']}")
     for x in ext:
-        print(f"  ✎ {fmt_ts(x['to'])[11:]}        modificati fuori da Claude: "
+        print(f"  ✎ {fmt_ts(x['to'])[11:]}        modified outside Claude: "
               + ", ".join(f"{ch['path']}(+{ch['add']}/-{ch['del']})" for ch in x["changes"]))
     for f in fby.get(None, []):
         if f["kind"] != "external_change":
@@ -788,11 +792,11 @@ def cmd_diff(args):
         for c in s["calls"]:
             if c["id"] and c["id"].startswith(args.call):
                 if not c["fs_verified"]:
-                    sys.exit("questa chiamata non ha foto del filesystem (flightrec non attivo?)")
+                    sys.exit("this call has no filesystem snapshots (was flightrec active?)")
                 out = p.snap.diff(c["tree_pre"], c["tree_post"])
-                print(out or "(nessuna modifica ai file)")
+                print(out or "(no file changes)")
                 return
-    sys.exit("chiamata non trovata")
+    sys.exit("call not found")
 
 
 def cmd_findings(args):
@@ -809,7 +813,7 @@ def main(argv=None):
 
     def common(sp):
         sp.add_argument("--project", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-        sp.add_argument("--recdir", default=None, help="cartella dei dati (default: PROJECT/.claude/flightrec)")
+        sp.add_argument("--recdir", default=None, help="data directory (default: PROJECT/.claude/flightrec)")
         return sp
     b = common(sub.add_parser("build")); b.add_argument("--out"); b.set_defaults(f=cmd_build)
     common(sub.add_parser("sessions")).set_defaults(f=cmd_sessions)
