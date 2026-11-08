@@ -1,0 +1,824 @@
+#!/usr/bin/env python3
+"""flightrec: resoconto deterministico di cosa ha fatto Claude Code in un progetto.
+
+Incrocia tre fonti, unite per session_id + tool_use_id:
+  1. transcript di Claude Code (intenzione, input, risultato di ogni tool)
+  2. eventi degli hook registrati da flightrec (orari precisi pre/post, esito)
+  3. foto del progetto in un git separato (effetto reale sui file, anche via Bash)
+
+Nessun LLM: ogni segnalazione viene da una regola fissa e cita le prove.
+
+Uso:
+  flightrec build    [--project DIR] [--out DIR]   crea flightrec.db e report.html
+  flightrec sessions [--project DIR]               elenco sessioni
+  flightrec timeline [SESSION] [--project DIR]     cronologia nel terminale
+  flightrec diff TOOL_USE_ID [--project DIR]       diff reale prodotto da una chiamata
+  flightrec findings [--project DIR]               solo le segnalazioni
+Richiede solo Python 3.8+ e git.
+"""
+import argparse, bisect, datetime as dt, hashlib, html, json, os, re, sqlite3, subprocess, sys
+from collections import Counter, defaultdict
+
+VERSION = "0.1.0"
+ZERO = "0" * 40
+EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
+READONLY = {"Read", "Grep", "Glob", "LS", "WebFetch", "WebSearch", "TodoWrite", "TodoRead", "ToolSearch",
+            "AskUserQuestion", "ExitPlanMode", "EnterPlanMode", "TaskGet", "TaskList", "TaskCreate",
+            "TaskUpdate", "TaskOutput", "BashOutput", "ListMcpResourcesTool", "ReadMcpResourceTool"}
+SLOW_SECONDS = 60
+HTML_TEXT_CAP = 60000  # caratteri per campo nel report; il db contiene tutto
+
+
+# ----------------------------------------------------------------------------- utilità
+def parse_ts(s):
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        return float(s)
+    try:
+        return dt.datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def fmt_ts(t):
+    if t is None:
+        return ""
+    return dt.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def read_jsonl(path):
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for n, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    out.append({"_bad_line": n})
+    except OSError:
+        pass
+    return out
+
+
+def block_text(content):
+    """Testo di un campo content (stringa o lista di blocchi)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict):
+                if b.get("type") == "text":
+                    parts.append(b.get("text", ""))
+                elif b.get("type") == "image":
+                    parts.append("[immagine]")
+                elif "content" in b:
+                    parts.append(block_text(b["content"]))
+            elif isinstance(b, str):
+                parts.append(b)
+        return "\n".join(parts)
+    return json.dumps(content, ensure_ascii=False)
+
+
+def input_hash(name, inp):
+    return hashlib.sha1((name + json.dumps(inp, sort_keys=True, ensure_ascii=False)).encode()).hexdigest()[:12]
+
+
+def project_key(root):
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(root))
+
+
+def rel(path, root):
+    if not path:
+        return None
+    p = path if os.path.isabs(path) else os.path.join(root, path)
+    p = os.path.normpath(p)
+    r = os.path.normpath(root)
+    if p == r:
+        return "."
+    if p.startswith(r + os.sep):
+        return p[len(r) + 1:]
+    return p  # fuori dal progetto: percorso assoluto
+
+
+def short_input(name, inp, root=None):
+    if not isinstance(inp, dict):
+        return str(inp)[:200]
+    for k in ("command", "file_path", "notebook_path", "pattern", "url", "query", "description", "prompt", "path"):
+        if inp.get(k):
+            v = str(inp[k])
+            if root and k in ("file_path", "notebook_path", "path"):
+                v = rel(v, root)
+            return v.replace("\n", " ⏎ ")[:200]
+    return json.dumps(inp, ensure_ascii=False)[:200]
+
+
+# ----------------------------------------------------------------------------- git
+class Snapshots:
+    def __init__(self, gitdir):
+        self.gitdir = gitdir
+        self.ok = os.path.isdir(gitdir)
+        self._cache = {}
+
+    def _git(self, *args, check=True):
+        r = subprocess.run(["git", "--git-dir", self.gitdir, *args], capture_output=True)
+        if check and r.returncode != 0:
+            return None
+        return r.stdout.decode("utf-8", errors="replace")
+
+    def changes(self, a, b):
+        """[{path, status, old, new, add, del, binary}] tra due alberi."""
+        if not (self.ok and a and b) or a == b:
+            return []
+        key = (a, b)
+        if key in self._cache:
+            return self._cache[key]
+        out = self._git("diff-tree", "-r", "--no-renames", "--raw", "--numstat", "-z", a, b)
+        res = []
+        if out:
+            parts = out.split("\0")
+            i, raw, nums = 0, {}, {}
+            while i < len(parts):
+                p = parts[i]
+                if p.startswith(":"):
+                    f = p[1:].split()
+                    raw[parts[i + 1]] = (f[2], f[3], f[4][0])
+                    i += 2
+                elif p.strip():
+                    f = p.split("\t")
+                    if len(f) >= 3:
+                        nums[f[2]] = (f[0], f[1])
+                    i += 1
+                else:
+                    i += 1
+            for path, (old, new, st) in raw.items():
+                ad, de = nums.get(path, ("0", "0"))
+                binary = ad == "-"
+                res.append({"path": path, "status": st, "old": old, "new": new,
+                            "add": 0 if binary else int(ad), "del": 0 if binary else int(de), "binary": binary})
+        res.sort(key=lambda c: c["path"])
+        self._cache[key] = res
+        return res
+
+    def diff(self, a, b, paths=None):
+        if not (self.ok and a and b) or a == b:
+            return ""
+        args = ["diff", "--no-color", "--no-renames", a, b]
+        if paths:
+            args += ["--", *paths]
+        return self._git(*args, check=False) or ""
+
+
+# ----------------------------------------------------------------------------- transcript
+def parse_transcript(path, root, agent=None):
+    """Restituisce (meta, prompts, calls) da un transcript JSONL di Claude Code."""
+    lines = read_jsonl(path)
+    meta = {"transcript": path, "session": None, "model": Counter(), "tokens_in": 0, "tokens_out": 0,
+            "tokens_cache_read": 0, "tokens_cache_write": 0, "start": None, "end": None, "version": None,
+            "git_branch": None, "interruptions": 0, "bad_lines": 0, "texts": 0}
+    prompts, calls, by_id = [], [], {}
+    seen_msgs = set()
+    intent = []  # testo/ragionamento dall'ultimo risultato
+    seq = 0
+    for ln in lines:
+        if "_bad_line" in ln:
+            meta["bad_lines"] += 1
+            continue
+        t = parse_ts(ln.get("timestamp"))
+        if t:
+            meta["start"] = t if meta["start"] is None else min(meta["start"], t)
+            meta["end"] = t if meta["end"] is None else max(meta["end"], t)
+        meta["session"] = meta["session"] or ln.get("sessionId")
+        meta["version"] = meta["version"] or ln.get("version")
+        meta["git_branch"] = meta["git_branch"] or ln.get("gitBranch")
+        typ = ln.get("type")
+        msg = ln.get("message") or {}
+        if typ == "assistant":
+            mid = msg.get("id")
+            if mid and mid not in seen_msgs:
+                seen_msgs.add(mid)
+                u = msg.get("usage") or {}
+                meta["tokens_in"] += u.get("input_tokens", 0) or 0
+                meta["tokens_out"] += u.get("output_tokens", 0) or 0
+                meta["tokens_cache_read"] += u.get("cache_read_input_tokens", 0) or 0
+                meta["tokens_cache_write"] += u.get("cache_creation_input_tokens", 0) or 0
+                if msg.get("model"):
+                    meta["model"][msg["model"]] += 1
+            for b in msg.get("content") or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and b.get("text", "").strip():
+                    intent.append(("text", b["text"]))
+                    meta["texts"] += 1
+                elif b.get("type") == "thinking" and b.get("thinking"):
+                    intent.append(("thinking", b["thinking"]))
+                elif b.get("type") in ("tool_use", "server_tool_use"):
+                    seq += 1
+                    c = {"id": b.get("id"), "tool": b.get("name"), "input": b.get("input") or {},
+                         "requested": t, "seq": seq, "prompt_idx": len(prompts) - 1, "agent": agent,
+                         "intent": "\n\n".join(x for k, x in intent if k == "text"),
+                         "thinking": "\n\n".join(x for k, x in intent if k == "thinking"),
+                         "result": None, "result_ts": None, "is_error": False, "tool_use_result": None}
+                    calls.append(c)
+                    if c["id"]:
+                        by_id[c["id"]] = c
+        elif typ == "user":
+            content = msg.get("content")
+            blocks = content if isinstance(content, list) else None
+            has_result = blocks and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks)
+            if has_result:
+                for b in blocks:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        c = by_id.get(b.get("tool_use_id"))
+                        if c:
+                            c["result"] = block_text(b.get("content"))
+                            c["result_ts"] = t
+                            c["is_error"] = bool(b.get("is_error"))
+                            c["tool_use_result"] = ln.get("toolUseResult")
+                intent = []
+            else:
+                text = block_text(content)
+                if "[Request interrupted by user" in text:
+                    meta["interruptions"] += 1
+                    continue
+                if ln.get("isMeta") or not text.strip():
+                    continue
+                if text.lstrip().startswith(("<command-name>", "<local-command-stdout>", "<local-command-caveat>")):
+                    continue
+                prompts.append({"ts": t, "text": text})
+                intent = []
+    for c in calls:
+        r = c["result"] or ""
+        if c["result"] is None:
+            c["status"] = "no_result"
+        elif "[Request interrupted by user" in r:
+            c["status"] = "interrupted"
+            meta["interruptions"] += 1
+        elif "doesn't want to proceed" in r or "was rejected" in r or "Permission to use" in r and "denied" in r:
+            c["status"] = "denied"
+        elif c["is_error"] or r.lstrip().startswith("<tool_use_error>"):
+            c["status"] = "error"
+        else:
+            c["status"] = "ok"
+    return meta, prompts, calls
+
+
+# ----------------------------------------------------------------------------- modello
+class Project:
+    def __init__(self, root, recdir=None):
+        self.root = os.path.abspath(root)
+        self.recdir = recdir or os.path.join(self.root, ".claude", "flightrec")
+        self.snap = Snapshots(os.path.join(self.recdir, "snapshots.git"))
+        self.events = read_jsonl(os.path.join(self.recdir, "events.jsonl"))
+        self.sessions = {}
+
+    def transcript_paths(self):
+        """session_id -> [percorso transcript principale, ...subagenti]"""
+        found = {}
+        # 1) percorsi visti negli eventi
+        for e in self.events:
+            p = (e.get("payload") or {}).get("transcript_path")
+            if e.get("session") and p:
+                found.setdefault(e["session"], p)
+        # 2) storico di Claude Code per questo progetto
+        hist = os.path.join(os.path.expanduser("~/.claude/projects"), project_key(self.root))
+        if os.path.isdir(hist):
+            for f in os.listdir(hist):
+                if f.endswith(".jsonl"):
+                    found.setdefault(f[:-6], os.path.join(hist, f))
+        # 3) archivio di flightrec (usato se l'originale è sparito o più corto)
+        arch = os.path.join(self.recdir, "transcripts")
+        if os.path.isdir(arch):
+            for f in os.listdir(arch):
+                if f.endswith(".jsonl"):
+                    sid, ap = f[:-6], os.path.join(arch, f)
+                    cur = found.get(sid)
+                    if not cur or not os.path.exists(cur) or os.path.getsize(cur) < os.path.getsize(ap):
+                        found[sid] = ap
+        out = {}
+        for sid, p in found.items():
+            subs = []
+            for d in (p[:-6] + "/subagents", os.path.join(arch, sid + ".subagents")):
+                if os.path.isdir(d):
+                    subs += [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".jsonl")]
+            seen, uniq = set(), []
+            for s in subs:
+                if os.path.basename(s) not in seen:
+                    seen.add(os.path.basename(s)); uniq.append(s)
+            out[sid] = [p] + uniq
+        return out
+
+    def build(self):
+        ev_by_session = defaultdict(list)
+        for e in self.events:
+            if e.get("session"):
+                ev_by_session[e["session"]].append(e)
+        paths = self.transcript_paths()
+        for sid in set(paths) | set(ev_by_session):
+            self.sessions[sid] = self._session(sid, paths.get(sid, []), sorted(ev_by_session.get(sid, []), key=lambda e: e.get("ts") or 0))
+        return self
+
+    # -------------------------------------------------------------------- sessione
+    def _session(self, sid, tpaths, events):
+        meta, prompts, calls = ({"transcript": None, "model": Counter(), "start": None, "end": None,
+                                 "interruptions": 0, "tokens_in": 0, "tokens_out": 0, "tokens_cache_read": 0,
+                                 "tokens_cache_write": 0, "bad_lines": 0, "version": None, "git_branch": None}, [], [])
+        if tpaths and os.path.exists(tpaths[0]):
+            meta, prompts, calls = parse_transcript(tpaths[0], self.root)
+        for sp in tpaths[1:]:
+            if os.path.exists(sp):
+                aid = os.path.basename(sp)[:-6]
+                m2, _, c2 = parse_transcript(sp, self.root, agent=aid)
+                for k in ("tokens_in", "tokens_out", "tokens_cache_read", "tokens_cache_write", "interruptions"):
+                    meta[k] += m2[k]
+                meta["model"].update(m2["model"])
+                calls += c2
+        by_id = {c["id"]: c for c in calls if c["id"]}
+
+        # --- eventi degli hook: pre/post per tool_use_id
+        hook = defaultdict(dict)
+        snaps = []  # (ts, kind, tree, ref)
+        for e in events:
+            ts, ev, tid = e.get("ts"), e.get("event"), e.get("id")
+            if ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure") and tid:
+                key = "pre" if ev == "PreToolUse" else "post"
+                hook[tid][key] = e
+                if tid not in by_id:  # chiamata senza transcript (es. subagente non archiviato)
+                    p = e.get("payload") or {}
+                    c = {"id": tid, "tool": e.get("tool"), "input": p.get("tool_input") or {}, "requested": ts,
+                         "seq": 10 ** 6 + len(by_id), "prompt_idx": None, "agent": e.get("agent"), "intent": "",
+                         "thinking": "", "result": None, "result_ts": None, "is_error": False,
+                         "tool_use_result": None, "status": "no_result", "from_hooks_only": True}
+                    calls.append(c)
+                    by_id[tid] = c
+            if e.get("tree"):
+                snaps.append((ts, ev, e["tree"], tid))
+
+        recorded = bool(events)
+        for c in calls:
+            h = hook.get(c["id"], {})
+            pre, post = h.get("pre"), h.get("post")
+            c["ts_pre"] = pre.get("ts") if pre else None
+            c["ts_post"] = post.get("ts") if post else None
+            c["tree_pre"] = pre.get("tree") if pre else None
+            c["tree_post"] = post.get("tree") if post else None
+            if post and post.get("event") == "PostToolUseFailure":
+                p = post.get("payload") or {}
+                if c["status"] in ("ok", "no_result"):
+                    c["status"] = "interrupted" if p.get("is_interrupt") else "error"
+                if not c["result"] and p.get("error"):
+                    c["result"] = str(p.get("error"))
+            if c["ts_pre"] and c["ts_post"]:
+                c["duration"] = max(0.0, c["ts_post"] - c["ts_pre"])
+            elif c["requested"] and c["result_ts"]:
+                c["duration"] = max(0.0, c["result_ts"] - c["requested"])
+            else:
+                c["duration"] = None
+            c["t"] = c["ts_pre"] or c["requested"] or c["ts_post"] or 0
+            c["hooked"] = bool(pre or post)
+        calls.sort(key=lambda c: (c["t"], c["seq"]))
+
+        # --- concorrenza: intervalli pre/post sovrapposti
+        iv = [(c["ts_pre"], c["ts_post"], c) for c in calls if c["ts_pre"] and c["ts_post"]]
+        for c in calls:
+            c["concurrent_with"] = []
+        for i, (a0, a1, ca) in enumerate(iv):
+            for b0, b1, cb in iv[i + 1:]:
+                if b0 < a1 and a0 < b1 and (ca["tree_pre"] or cb["tree_pre"]):
+                    ca["concurrent_with"].append(cb["id"]); cb["concurrent_with"].append(ca["id"])
+
+        # --- effetti reali sui file
+        for c in calls:
+            c["declared"] = sorted({rel(p, self.root) for p in declared_paths(c["tool"], c["input"]) if p})
+            if c["tree_pre"] and c["tree_post"]:
+                c["fs"] = self.snap.changes(c["tree_pre"], c["tree_post"])
+                c["fs_verified"] = True
+            else:
+                c["fs"] = fallback_changes(c, self.root)
+                c["fs_verified"] = False
+
+        # --- modifiche fatte da altri (utente, altri processi) tra un'azione e l'altra
+        external = []
+        if self.snap.ok and snaps:
+            open_ids = set()
+            points = []
+            for ts, ev, tree, tid in sorted(snaps, key=lambda s: s[0] or 0):
+                points.append((ts, ev, tree, tid))
+            last = None  # (ts, tree, label)
+            for ts, ev, tree, tid in points:
+                if ev == "PreToolUse":
+                    if last and not open_ids and last[1] != tree:
+                        external.append({"from": last[0], "to": ts, "after": last[2], "before": tid,
+                                         "tree_from": last[1], "tree_to": tree,
+                                         "changes": self.snap.changes(last[1], tree)})
+                    open_ids.add(tid)
+                elif ev in ("PostToolUse", "PostToolUseFailure"):
+                    open_ids.discard(tid)
+                else:
+                    if last and not open_ids and last[1] != tree:
+                        external.append({"from": last[0], "to": ts, "after": last[2], "before": ev,
+                                         "tree_from": last[1], "tree_to": tree,
+                                         "changes": self.snap.changes(last[1], tree)})
+                label = tid if ev.startswith("PostToolUse") else ev
+                if not open_ids:
+                    last = (ts, tree, label)
+        external = [x for x in external if x["changes"]]
+
+        s = {"id": sid, "meta": meta, "prompts": prompts, "calls": calls, "external": external,
+             "recorded": recorded, "transcripts": tpaths, "events": len(events)}
+        s["findings"] = analyze(s, self.snap)
+        s["stats"] = stats(s)
+        return s
+
+
+def declared_paths(tool, inp):
+    if not isinstance(inp, dict):
+        return []
+    out = []
+    for k in ("file_path", "notebook_path"):
+        if inp.get(k):
+            out.append(inp[k])
+    return out
+
+
+def fallback_changes(c, root):
+    """Senza foto: deduce dal transcript i cambiamenti dichiarati (non verificati)."""
+    if c["status"] != "ok" or c["tool"] not in EDIT_TOOLS:
+        return []
+    out = []
+    tur = c.get("tool_use_result") if isinstance(c.get("tool_use_result"), dict) else {}
+    for p in c["declared"]:
+        add = dele = 0
+        for h in tur.get("structuredPatch") or []:
+            for l in h.get("lines", []):
+                if l.startswith("+"):
+                    add += 1
+                elif l.startswith("-"):
+                    dele += 1
+        if c["tool"] == "Write" and not tur.get("structuredPatch"):
+            add = len(str((c["input"] or {}).get("content", "")).splitlines())
+        out.append({"path": p, "status": "A" if tur.get("type") == "create" else "M", "old": None, "new": None,
+                    "add": add, "del": dele, "binary": False})
+    return out
+
+
+# ----------------------------------------------------------------------------- regole
+def analyze(s, snap):
+    F = []
+
+    def add(kind, sev, msg, call=None, **ev):
+        F.append({"kind": kind, "severity": sev, "message": msg, "call": call["id"] if call else None,
+                  "t": (call or {}).get("t"), "evidence": ev})
+
+    calls = s["calls"]
+    errored = {}  # hash input -> prima chiamata fallita
+    retries = {}  # hash input -> segnalazione di retry aperta
+    reads = defaultdict(list)
+    file_history = defaultdict(list)  # path -> [(blob_prima, blob_dopo, call)]
+    last_change = {}  # path -> t ultima modifica
+    for c in calls:
+        tool, st = c["tool"], c["status"]
+        h = input_hash(tool or "", c["input"])
+        # R1 errori (i tentativi identici sono raccolti in R2)
+        if st == "error" and h not in errored:
+            add("tool_error", "warn", f"{tool} è fallito: {first_line(c['result'])}", c)
+        elif st == "denied":
+            add("denied", "info", f"{tool} non autorizzato", c)
+        elif st == "interrupted":
+            add("interrupted", "warn", f"{tool} interrotto", c)
+        elif st == "no_result" and not c.get("from_hooks_only"):
+            add("no_result", "warn", f"{tool} senza risultato nel transcript (sessione interrotta?)", c)
+        # R2 tentativo identico dopo un errore; più ripetizioni = un solo "loop"
+        if h in errored:
+            r = retries.get(h)
+            if r is None:
+                add("identical_retry", "warn",
+                    f"{tool} ripetuto con input identico dopo un errore (passo #{errored[h]['seq']})", c,
+                    previous=errored[h]["id"], repeats=[c["id"]])
+                retries[h] = F[-1]
+            else:
+                r["evidence"]["repeats"].append(c["id"])
+                k = len(r["evidence"]["repeats"])
+                ok_end = "" if st == "error" else ", poi riuscito"
+                r["kind"] = "retry_loop" if k >= 3 else "identical_retry"
+                r["message"] = (f"{tool} ripetuto {k} volte con input identico dopo un errore "
+                                f"(dal passo #{errored[h]['seq']} al #{c['seq']}{ok_end})")
+        if st == "error":
+            errored.setdefault(h, c)
+        elif h in errored:
+            errored.pop(h); retries.pop(h, None)
+        # R3 riletture senza modifiche in mezzo
+        if tool == "Read" and c["declared"]:
+            p = c["declared"][0]
+            reads[p] = [r for r in reads[p] if r["t"] >= last_change.get(p, 0)]
+            reads[p].append(c)
+            if len(reads[p]) == 3:
+                add("repeated_read", "info", f"{p} letto 3 volte senza modifiche nel frattempo", c,
+                    reads=[r["id"] for r in reads[p]])
+        # R4 lento
+        if c["duration"] and c["duration"] > SLOW_SECONDS:
+            add("slow", "info", f"{tool} ha impiegato {c['duration']:.0f} s", c)
+        # effetti sui file
+        changed = {ch["path"] for ch in c["fs"]}
+        for ch in c["fs"]:
+            last_change[ch["path"]] = c["t"]
+        if c["fs_verified"]:
+            # R5 dichiarato ma nessun effetto
+            if tool in EDIT_TOOLS and st == "ok":
+                for p in c["declared"]:
+                    if p not in changed and not c["concurrent_with"]:
+                        add("no_effect", "warn", f"{tool} riuscito ma {p} non è cambiato sul disco", c, path=p)
+            # R6 file toccati non dichiarati
+            extra = sorted(changed - set(c["declared"]))
+            if extra:
+                if c["concurrent_with"]:
+                    add("shared_attribution", "info",
+                        f"{len(extra)} file cambiati mentre giravano chiamate parallele: attribuzione condivisa", c,
+                        files=extra, concurrent=c["concurrent_with"])
+                elif tool in EDIT_TOOLS:
+                    add("side_effect", "warn", f"{tool} su {', '.join(c['declared'])} ha cambiato anche: {', '.join(extra)}", c, files=extra)
+                else:
+                    add("indirect_change", "info", f"{tool} ha modificato {len(extra)} file: {', '.join(extra[:5])}"
+                        + (" …" if len(extra) > 5 else ""), c, files=extra)
+            # R7 errore ma il disco è cambiato comunque
+            if st in ("error", "interrupted") and changed:
+                add("error_with_changes", "warn", f"{tool} risulta fallito ma ha cambiato {len(changed)} file", c, files=sorted(changed))
+            # R8 modifiche annullate (contenuto tornato a una versione precedente)
+            for ch in c["fs"]:
+                hist = file_history[ch["path"]]
+                earlier = {x[0] for x in hist}
+                if hist and ch["new"] in earlier and ch["new"] != ch["old"]:
+                    first = next(x for x in hist if x[0] == ch["new"])
+                    what = "eliminato (era stato creato in questa sessione)" if ch["new"] == ZERO else "riportato a una versione precedente"
+                    add("reverted", "warn", f"{ch['path']} {what}: annulla il lavoro dal passo {first[2]['seq']}", c,
+                        path=ch["path"], since=first[2]["id"])
+                hist.append((ch["old"], ch["new"], c))
+    # R9 modifiche esterne
+    for x in s["external"]:
+        files = [ch["path"] for ch in x["changes"]]
+        F.append({"kind": "external_change", "severity": "info", "call": None, "t": x["to"],
+                  "message": f"{len(files)} file modificati fuori dalle azioni di Claude (tu o un altro processo): "
+                             + ", ".join(files[:5]) + (" …" if len(files) > 5 else ""),
+                  "evidence": {"files": files, "after": x["after"], "before": x["before"]}})
+    # R10 interruzioni
+    if s["meta"]["interruptions"]:
+        F.append({"kind": "user_interrupt", "severity": "info", "call": None, "t": None,
+                  "message": f"Hai interrotto Claude {s['meta']['interruptions']} volte", "evidence": {}})
+    if s["calls"] and not s["recorded"]:
+        F.append({"kind": "unverified", "severity": "info", "call": None, "t": None,
+                  "message": "Sessione senza registrazione flightrec: effetti sui file dedotti dal transcript, non verificati",
+                  "evidence": {}})
+    F.sort(key=lambda f: (f["t"] or 0))
+    return F
+
+
+def first_line(t):
+    t = (t or "").strip().replace("<tool_use_error>", "").replace("</tool_use_error>", "")
+    return (t.splitlines() or [""])[0][:160]
+
+
+def stats(s):
+    calls = s["calls"]
+    by_tool = Counter(c["tool"] for c in calls)
+    status = Counter(c["status"] for c in calls)
+    files = defaultdict(lambda: {"add": 0, "del": 0, "calls": 0})
+    for c in calls:
+        for ch in c["fs"]:
+            f = files[ch["path"]]
+            f["add"] += ch["add"]; f["del"] += ch["del"]; f["calls"] += 1
+    ext_files = {ch["path"] for x in s["external"] for ch in x["changes"]}
+    tool_time = sum(c["duration"] or 0 for c in calls)
+    m = s["meta"]
+    starts = [x for x in [m["start"]] + [c["t"] for c in calls] + [p["ts"] for p in s["prompts"]] if x]
+    ends = [x for x in [m["end"]] + [c["ts_post"] or c["result_ts"] or c["t"] for c in calls] if x]
+    start, end = (min(starts) if starts else None), (max(ends) if ends else None)
+    kinds = Counter(f["kind"] for f in s["findings"])
+    return {"start": start, "end": end, "duration": (end - start) if start and end else None,
+            "prompts": len(s["prompts"]), "calls": len(calls), "by_tool": dict(by_tool.most_common()),
+            "status": dict(status), "errors": status.get("error", 0),
+            "files_changed": len(files), "lines_add": sum(f["add"] for f in files.values()),
+            "lines_del": sum(f["del"] for f in files.values()), "files": dict(files),
+            "external_files": len(ext_files), "tool_time": tool_time,
+            "subagent_calls": sum(1 for c in calls if c["agent"]), "findings": dict(kinds),
+            "tokens": {k: m.get(k, 0) for k in ("tokens_in", "tokens_out", "tokens_cache_read", "tokens_cache_write")},
+            "models": dict(m["model"]), "recorded": s["recorded"],
+            "verified_calls": sum(1 for c in calls if c["fs_verified"])}
+
+
+# ----------------------------------------------------------------------------- sqlite
+SCHEMA = """
+CREATE TABLE sessions(id TEXT PRIMARY KEY, start REAL, end REAL, prompts INT, calls INT, errors INT,
+  files_changed INT, lines_add INT, lines_del INT, recorded INT, transcript TEXT, stats TEXT);
+CREATE TABLE prompts(session TEXT, idx INT, ts REAL, text TEXT);
+CREATE TABLE calls(id TEXT, session TEXT, seq INT, prompt_idx INT, agent TEXT, tool TEXT, input TEXT,
+  intent TEXT, thinking TEXT, status TEXT, result TEXT, t REAL, ts_pre REAL, ts_post REAL, duration REAL,
+  tree_pre TEXT, tree_post TEXT, fs_verified INT, declared TEXT, concurrent_with TEXT);
+CREATE TABLE file_changes(call TEXT, session TEXT, path TEXT, status TEXT, old_blob TEXT, new_blob TEXT,
+  lines_add INT, lines_del INT, binary INT, verified INT);
+CREATE TABLE external_changes(session TEXT, t_from REAL, t_to REAL, after TEXT, before TEXT, path TEXT, status TEXT, lines_add INT, lines_del INT);
+CREATE TABLE findings(session TEXT, call TEXT, t REAL, kind TEXT, severity TEXT, message TEXT, evidence TEXT);
+CREATE INDEX calls_s ON calls(session); CREATE INDEX fc_path ON file_changes(path);
+"""
+
+
+def write_db(project, path):
+    if os.path.exists(path):
+        os.remove(path)
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    J = lambda o: json.dumps(o, ensure_ascii=False, default=str)
+    for s in project.sessions.values():
+        st = s["stats"]
+        db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (s["id"], st["start"], st["end"], st["prompts"], st["calls"], st["errors"], st["files_changed"],
+                    st["lines_add"], st["lines_del"], int(s["recorded"]), (s["transcripts"] or [None])[0], J(st)))
+        for i, p in enumerate(s["prompts"]):
+            db.execute("INSERT INTO prompts VALUES(?,?,?,?)", (s["id"], i, p["ts"], p["text"]))
+        for c in s["calls"]:
+            db.execute("INSERT INTO calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (c["id"], s["id"], c["seq"], c["prompt_idx"], c["agent"], c["tool"], J(c["input"]), c["intent"],
+                        c["thinking"], c["status"], c["result"], c["t"], c["ts_pre"], c["ts_post"], c["duration"],
+                        c["tree_pre"], c["tree_post"], int(c["fs_verified"]), J(c["declared"]), J(c["concurrent_with"])))
+            for ch in c["fs"]:
+                db.execute("INSERT INTO file_changes VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           (c["id"], s["id"], ch["path"], ch["status"], ch["old"], ch["new"], ch["add"], ch["del"],
+                            int(ch["binary"]), int(c["fs_verified"])))
+        for x in s["external"]:
+            for ch in x["changes"]:
+                db.execute("INSERT INTO external_changes VALUES(?,?,?,?,?,?,?,?,?)",
+                           (s["id"], x["from"], x["to"], x["after"], x["before"], ch["path"], ch["status"], ch["add"], ch["del"]))
+        for f in s["findings"]:
+            db.execute("INSERT INTO findings VALUES(?,?,?,?,?,?,?)",
+                       (s["id"], f["call"], f["t"], f["kind"], f["severity"], f["message"], J(f["evidence"])))
+    db.commit()
+    db.close()
+
+
+# ----------------------------------------------------------------------------- html
+def cap(t, n=HTML_TEXT_CAP):
+    if t is None:
+        return None
+    t = str(t)
+    return t if len(t) <= n else t[:n] + f"\n… [troncato nel report: {len(t) - n} caratteri in più, completo in flightrec.db]"
+
+
+def report_data(project):
+    sessions = []
+    for s in sorted(project.sessions.values(), key=lambda s: s["stats"]["start"] or 0, reverse=True):
+        calls = []
+        for c in s["calls"]:
+            d = ""
+            if c["fs_verified"] and c["fs"]:
+                d = project.snap.diff(c["tree_pre"], c["tree_post"])
+            calls.append({"id": c["id"], "seq": c["seq"], "p": c["prompt_idx"], "agent": c["agent"], "tool": c["tool"],
+                          "short": short_input(c["tool"] or "", c["input"], project.root),
+                          "input": cap(json.dumps(c["input"], ensure_ascii=False, indent=2)),
+                          "intent": cap(c["intent"]), "thinking": cap(c["thinking"]), "status": c["status"],
+                          "result": cap(c["result"]), "t": c["t"], "dur": c["duration"], "fs": c["fs"],
+                          "verified": c["fs_verified"], "conc": c["concurrent_with"], "diff": cap(d)})
+        ext = [{"from": x["from"], "to": x["to"], "changes": x["changes"],
+                "diff": cap(project.snap.diff(*_ext_trees(project, s, x)))} for x in s["external"]]
+        sessions.append({"id": s["id"], "stats": s["stats"], "findings": s["findings"],
+                         "prompts": [{"ts": p["ts"], "text": cap(p["text"], 4000)} for p in s["prompts"]],
+                         "calls": calls, "external": ext, "transcript": (s["transcripts"] or [None])[0]})
+    return {"project": project.root, "generated": dt.datetime.now().isoformat(timespec="seconds"),
+            "version": VERSION, "sessions": sessions}
+
+
+def _ext_trees(project, s, x):
+    return x.get("tree_from"), x.get("tree_to")
+
+
+def write_html(project, path):
+    data = json.dumps(report_data(project), ensure_ascii=False, default=str).replace("</", "<\\/")
+    tpl = open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "report_template.html"), encoding="utf-8").read()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(tpl.replace("__FLIGHTREC_DATA__", data).replace("__TITLE__", html.escape(os.path.basename(project.root))))
+
+
+# ----------------------------------------------------------------------------- CLI
+def load(args):
+    return Project(args.project, args.recdir).build()
+
+
+def cmd_build(args):
+    p = load(args)
+    out = args.out or p.recdir
+    os.makedirs(out, exist_ok=True)
+    write_db(p, os.path.join(out, "flightrec.db"))
+    write_html(p, os.path.join(out, "report.html"))
+    n = len(p.sessions)
+    calls = sum(len(s["calls"]) for s in p.sessions.values())
+    fnd = sum(len(s["findings"]) for s in p.sessions.values())
+    print(f"{n} sessioni, {calls} azioni, {fnd} segnalazioni")
+    print("report:  " + os.path.join(out, "report.html"))
+    print("dati:    " + os.path.join(out, "flightrec.db"))
+    if not p.events:
+        print("nota: nessun evento registrato in questo progetto; effetti sui file non verificati.")
+
+
+def cmd_sessions(args):
+    p = load(args)
+    for s in sorted(p.sessions.values(), key=lambda s: s["stats"]["start"] or 0):
+        st = s["stats"]
+        rec = "registrata" if s["recorded"] else "solo transcript"
+        print(f"{s['id']}  {fmt_ts(st['start'])}  {st['prompts']} prompt  {st['calls']} azioni  "
+              f"{st['errors']} errori  {st['files_changed']} file  +{st['lines_add']}/-{st['lines_del']}  [{rec}]")
+
+
+ICON = {"ok": "✓", "error": "✗", "denied": "⊘", "interrupted": "■", "no_result": "?"}
+
+
+def pick(p, sid):
+    if not p.sessions:
+        sys.exit("nessuna sessione trovata")
+    if sid:
+        m = [s for k, s in p.sessions.items() if k.startswith(sid)]
+        if not m:
+            sys.exit(f"sessione {sid} non trovata")
+        return m[0]
+    return max(p.sessions.values(), key=lambda s: s["stats"]["start"] or 0)
+
+
+def cmd_timeline(args):
+    p = load(args)
+    s = pick(p, args.session)
+    fby = defaultdict(list)
+    for f in s["findings"]:
+        fby[f["call"]].append(f)
+    print(f"sessione {s['id']}  {fmt_ts(s['stats']['start'])}")
+    pidx = None
+    ext = sorted(s["external"], key=lambda x: x["to"] or 0)
+    for c in s["calls"]:
+        while ext and (ext[0]["to"] or 0) <= (c["t"] or 0):
+            x = ext.pop(0)
+            print(f"  ✎ {fmt_ts(x['to'])[11:]}        modificati fuori da Claude: "
+                  + ", ".join(f"{ch['path']}(+{ch['add']}/-{ch['del']})" for ch in x["changes"]))
+        if c["prompt_idx"] != pidx and c["prompt_idx"] is not None and c["prompt_idx"] >= 0 and c["prompt_idx"] < len(s["prompts"]):
+            pidx = c["prompt_idx"]
+            print(f"\n» PROMPT: {first_line(s['prompts'][pidx]['text'])}")
+        if c["intent"] and args.verbose:
+            print("    💬 " + first_line(c["intent"]))
+        dur = f"{c['duration']:.1f}s" if c["duration"] is not None else "  ?"
+        fs = " ".join(f"{ch['status']}:{ch['path']}(+{ch['add']}/-{ch['del']})" for ch in c["fs"])
+        mark = "" if c["fs_verified"] or not c["fs"] else " (non verificato)"
+        ag = f"[{c['agent'][:8]}] " if c["agent"] else ""
+        print(f"  {ICON.get(c['status'], '?')} #{c['seq']:<3} {fmt_ts(c['t'])[11:]} {dur:>6} {ag}{c['tool']}: {short_input(c['tool'] or '', c['input'], p.root)[:90]}")
+        if fs:
+            print(f"        ↳ {fs}{mark}")
+        for f in fby.get(c["id"], []):
+            print(f"        ⚠ {f['message']}")
+    for x in ext:
+        print(f"  ✎ {fmt_ts(x['to'])[11:]}        modificati fuori da Claude: "
+              + ", ".join(f"{ch['path']}(+{ch['add']}/-{ch['del']})" for ch in x["changes"]))
+    for f in fby.get(None, []):
+        if f["kind"] != "external_change":
+            print(f"  ⚠ {f['message']}")
+
+
+def cmd_diff(args):
+    p = load(args)
+    for s in p.sessions.values():
+        for c in s["calls"]:
+            if c["id"] and c["id"].startswith(args.call):
+                if not c["fs_verified"]:
+                    sys.exit("questa chiamata non ha foto del filesystem (flightrec non attivo?)")
+                out = p.snap.diff(c["tree_pre"], c["tree_post"])
+                print(out or "(nessuna modifica ai file)")
+                return
+    sys.exit("chiamata non trovata")
+
+
+def cmd_findings(args):
+    p = load(args)
+    for s in sorted(p.sessions.values(), key=lambda s: s["stats"]["start"] or 0):
+        for f in s["findings"]:
+            print(f"{s['id'][:8]}  {fmt_ts(f['t'])}  {f['severity']:<4}  {f['kind']:<18}  {f['message']}")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="flightrec", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(sp):
+        sp.add_argument("--project", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+        sp.add_argument("--recdir", default=None, help="cartella dei dati (default: PROJECT/.claude/flightrec)")
+        return sp
+    b = common(sub.add_parser("build")); b.add_argument("--out"); b.set_defaults(f=cmd_build)
+    common(sub.add_parser("sessions")).set_defaults(f=cmd_sessions)
+    t = common(sub.add_parser("timeline")); t.add_argument("session", nargs="?"); t.add_argument("-v", "--verbose", action="store_true"); t.set_defaults(f=cmd_timeline)
+    d = common(sub.add_parser("diff")); d.add_argument("call"); d.set_defaults(f=cmd_diff)
+    common(sub.add_parser("findings")).set_defaults(f=cmd_findings)
+    args = ap.parse_args(argv)
+    args.f(args)
+
+
+if __name__ == "__main__":
+    main()
