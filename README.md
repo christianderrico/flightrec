@@ -2,7 +2,7 @@
 
 <img src="assets/flightrec-logo.svg" width="150" alt="flightrec logo">
 
-# flightrec
+# Flightrec
 
 ### The black box for Claude Code.
 
