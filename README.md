@@ -1,6 +1,29 @@
+<div align="center">
+
+<img src="assets/flightrec-logo.svg" width="150" alt="flightrec logo">
+
 # flightrec
 
-**A black box for Claude Code.** Records every agent action, verifies what actually changed on disk, and produces a deterministic report (no LLM required) that you can inspect offline: an HTML page and an SQLite database.
+### The black box for Claude Code.
+
+Record every action. Verify every change.
+Understand what really happened.
+
+[GitHub](https://github.com/donerrico99/flightrec) ·
+[Installation](#installation) ·
+[Documentation](#usage) ·
+[Issues](https://github.com/donerrico99/flightrec/issues)
+
+![License](https://img.shields.io/github/license/donerrico99/flightrec)
+![GitHub Stars](https://img.shields.io/github/stars/donerrico99/flightrec)
+![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue)
+
+</div>
+
+---
+
+Records every agent action, verifies what actually changed on disk, and produces a deterministic report (no LLM required) that you can inspect offline: an HTML page and an SQLite database.
 
 ```text
 » PROMPT: Rename beta to gamma and clean up the project
