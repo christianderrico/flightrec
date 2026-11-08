@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/flightrec-logo.svg" width="150" alt="flightrec logo">
+<img src="assets/flightrec-logo.png" width="150" alt="flightrec logo">
 
 # Flightrec
 
@@ -15,7 +15,6 @@ Understand what really happened.
 [Issues](https://github.com/donerrico99/flightrec/issues)
 
 ![License](https://img.shields.io/github/license/donerrico99/flightrec)
-![GitHub Stars](https://img.shields.io/github/stars/donerrico99/flightrec)
 ![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 
