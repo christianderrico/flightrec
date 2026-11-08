@@ -109,8 +109,11 @@ def main():
         W(f"{proj}/notes.txt", "alpha\nbeta\n")
         W(f"{proj}/app.py", "def main():\n    return 1\n")
         W(f"{proj}/config.toml", "debug = false\n")
-        W(f"{proj}/.gitignore", "secret.env\n_cc_home/\n")
+        W(f"{proj}/.gitignore", "secret.env\nlocal.env\n_cc_home/\n")
         W(f"{proj}/secret.env", "TOKEN=xyz\n")
+        # local.env è ignorato da git ma incluso esplicitamente nelle foto
+        W(f"{proj}/local.env", "PORT=1\n")
+        W(f"{proj}/.flightrecinclude", "# file ignorati da fotografare comunque\nlocal.env\n")
         s = Session(proj)
         s.hook("SessionStart", source="startup")
         P = lambda *a: os.path.join(proj, *a)
@@ -139,6 +142,7 @@ def main():
         # l'utente modifica un file tra un turno e l'altro (anche un file ignorato)
         W(P("notes.txt"), "ALPHA\ngamma\ndelta (scritto a mano)\n")
         W(P("secret.env"), "TOKEN=changed\n")
+        W(P("local.env"), "PORT=2\n")
 
         s.prompt("Prova a creare tmp.txt e poi rimuovilo; aggiorna config")
         s.tool("Write", {"file_path": P("tmp.txt"), "content": "temporaneo\n"},
@@ -176,7 +180,7 @@ def main():
         checks = [
             (not missing, f"segnalazioni mancanti: {missing}"),
             (calls[0] == 16 and calls[1] == 12, f"16 azioni, 12 verificate sul disco (le 4 Read non fanno foto): {calls}"),
-            (ext == ["notes.txt"], f"modifiche esterne solo notes.txt (secret.env ignorato, il recorder non fotografa sé stesso): {ext[:5]}"),
+            (sorted(ext) == ["local.env", "notes.txt"], f"modifiche esterne: notes.txt e local.env (incluso da .flightrecinclude); secret.env ignorato, il recorder non fotografa sé stesso: {ext[:5]}"),
             (os.path.exists(os.path.join(proj, ".claude/flightrec/transcripts", s.sid + ".jsonl")), "transcript archiviato nella cartella di flightrec"),
             (kinds.count("reverted") >= 2, f"attese 2 modifiche annullate (tmp.txt, app.py): {kinds.count('reverted')}"),
         ]

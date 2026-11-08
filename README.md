@@ -9,14 +9,14 @@
 Record every action. Verify every change.
 Understand what really happened.
 
-[GitHub](https://github.com/donerrico99/flightrec) ·
+[GitHub](https://github.com/christianderrico/flightrec) ·
 [Installation](#installation) ·
 [Documentation](#usage) ·
-[Issues](https://github.com/donerrico99/flightrec/issues)
+[Issues](https://github.com/christianderrico/flightrec/issues)
 
-![License](https://img.shields.io/github/license/donerrico99/flightrec)
-![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
-![Python](https://img.shields.io/badge/python-3.8%2B-blue)
+![License](https://img.shields.io/github/license/christianderrico/flightrec)
+[![Tests](https://github.com/christianderrico/flightrec/actions/workflows/tests.yml/badge.svg)](https://github.com/christianderrico/flightrec/actions/workflows/tests.yml)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 
 </div>
 
@@ -54,12 +54,14 @@ flightrec correlates these three sources using `session_id` + `tool_use_id`:
 
 ## Installation
 
-Requirements: `bash`, `jq`, `git`, `python3` (3.8+). No Python dependencies.
+Requirements: `bash`, `jq`, `git`, `python3` (3.9+). No Python dependencies.
+
+Platforms: Linux and macOS. On Windows, use WSL: native Windows (cmd/PowerShell) is not supported, because the hooks are bash scripts.
 
 Inside Claude Code:
 
 ```bash
-/plugin marketplace add donerrico99/flightrec
+/plugin marketplace add christianderrico/flightrec
 /plugin install flightrec@flightrec
 ```
 
@@ -76,6 +78,9 @@ Add the following line to your project's `.gitignore`:
 ```gitignore
 .claude/flightrec/
 ```
+
+> [!WARNING]
+> **Snapshots may contain secrets.** flightrec stores a full copy of every file in your project that is not ignored. If `.env`, credentials or keys are not listed in `.gitignore` (or `.flightrecignore`), they end up in `.claude/flightrec/snapshots.git/`, together with everything Claude reads and writes in `events.jsonl` and `transcripts/`. Check your ignore rules before the first session and never commit or share `.claude/flightrec/`.
 
 ## Usage
 
@@ -122,10 +127,13 @@ All findings are generated using deterministic rules, each backed by evidence (c
 ```
 
 - Snapshots respect your project's `.gitignore` and exclude `node_modules/`, `.venv/`, `__pycache__/`, and similar directories by default. Additional exclusions can be configured in `.flightrecignore` (using the same syntax as `.gitignore`).
+- To watch files that `.gitignore` excludes (for example `.env` or generated files, whose changes are often the interesting ones), list them one per line in `.flightrecinclude`, as Git pathspecs (`.env`, `config/*.local.json`). This is opt-in, because it copies those files into the snapshots. Removing a line only affects new files; to drop files that are already tracked, delete `.claude/flightrec/index`.
 - Your project's Git repository is never touched.
 - Snapshots are created only for tools that can modify files and at the beginning/end of each turn. Read, Grep, Glob, and similar tools only generate events. Read-only tool output is not duplicated (it is already available in the transcript); set `FLIGHTREC_KEEP_READ_OUTPUT=1` to store it anyway.
 
 **Privacy.** Everything stays local. The files contain whatever your project contains, as well as what Claude has read and written. Do not commit `.claude/flightrec/`.
+
+**Integrity.** flightrec is a tool for personal auditing and debugging, not a tamper-proof log. `events.jsonl` and the snapshots are ordinary files that any process with access to your project (including Claude itself) can edit or delete. Do not rely on them as forensic evidence.
 
 ## Performance
 
@@ -146,7 +154,9 @@ Hooks never write to stdout and never block Claude Code: if anything goes wrong,
 
 - With parallel calls, modifications occurring within the same time window are attributed to all overlapping calls (reported as `shared_attribution`).
 - Background processes launched by Bash that modify files after the command has finished are detected as `external_change` at the next step.
-- Files ignored by `.gitignore` are not included in snapshots, so changes to them are not detected.
+- Files ignored by `.gitignore` are not included in snapshots, so changes to them are not detected, unless you list them in `.flightrecinclude`.
+- The recording is not tamper-proof (see *Integrity* above).
+- Native Windows is not supported (use WSL).
 
 ## Tests
 
@@ -156,7 +166,11 @@ tests/run_all.sh
 
 The scenario test runs the actual hook against a temporary project, simulating a complete session (errors, retries, Bash side effects, parallel calls, external modifications, and reverted work) and verifies every finding.
 
-The parser test uses a real Claude Code 2.1.319 transcript.
+The parser test uses a real Claude Code 2.1.319 transcript. The same suite runs on every push and pull request in [GitHub Actions](.github/workflows/tests.yml), on Python 3.9 and 3.13.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 ## License
 

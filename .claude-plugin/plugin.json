@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Scatola nera per Claude Code: registra ogni azione dell'agente, ne verifica gli effetti reali sui file e produce un resoconto deterministico consultabile offline.",
   "author": {
-    "name": "donerrico99"
+    "name": "christianderrico"
   },
   "license": "MIT",
   "keywords": [

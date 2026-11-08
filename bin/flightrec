@@ -14,7 +14,7 @@ Uso:
   flightrec timeline [SESSION] [--project DIR]     cronologia nel terminale
   flightrec diff TOOL_USE_ID [--project DIR]       diff reale prodotto da una chiamata
   flightrec findings [--project DIR]               solo le segnalazioni
-Richiede solo Python 3.8+ e git.
+Richiede Python 3.9+, git, bash e jq (Linux, macOS o WSL).
 """
 import argparse, bisect, datetime as dt, hashlib, html, json, os, re, sqlite3, subprocess, sys
 from collections import Counter, defaultdict

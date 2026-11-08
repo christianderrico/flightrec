@@ -77,6 +77,15 @@ if [ "$SNAP" = 1 ] && command -v git >/dev/null 2>&1; then
            GIT_COMMITTER_NAME=flightrec GIT_COMMITTER_EMAIL=flightrec@localhost
     cd "$ROOT" 2>/dev/null || exit 0
     git -c core.autocrlf=false -c core.safecrlf=false add -A . >/dev/null 2>&1
+    # .flightrecinclude: file ignorati dal .gitignore da fotografare comunque (es. .env, file generati)
+    if [ -f "$ROOT/.flightrecinclude" ]; then
+      while IFS= read -r pat || [ -n "$pat" ]; do
+        pat="${pat%$'\r'}"
+        case "$pat" in ''|'#'*) continue ;; esac
+        git -c core.autocrlf=false -c core.safecrlf=false add -A -f -- "$pat" \
+          ":(exclude)${DIR#"$ROOT"/}" >/dev/null 2>&1
+      done < "$ROOT/.flightrecinclude"
+    fi
     t=$(git write-tree 2>/dev/null) || exit 0
     # tiene gli oggetti raggiungibili (un commit solo quando l'albero cambia)
     prev=$(git rev-parse -q --verify refs/flightrec/snapshots 2>/dev/null)
