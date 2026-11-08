@@ -1,146 +1,141 @@
 # flightrec
 
-**Una scatola nera per Claude Code.** Registra ogni azione dell'agente, verifica cosa è cambiato davvero sul disco
-e produce un resoconto deterministico (senza LLM) che puoi consultare offline: una pagina HTML e un database SQLite.
+**A black box for Claude Code.** Records every agent action, verifies what actually changed on disk, and produces a deterministic report (no LLM required) that you can inspect offline: an HTML page and an SQLite database.
 
-```
-» PROMPT: Rinomina beta in gamma e sistema il progetto
+```text
+» PROMPT: Rename beta to gamma and clean up the project
   ✓ #2   10:02:43   0.0s Edit: notes.txt
         ↳ M:notes.txt(+1/-1)
   ✗ #3   10:02:43   0.0s Bash: cat missing_file.txt
-        ⚠ Bash è fallito: Exit code 1
+        ⚠ Bash failed: Exit code 1
   ✓ #4   10:02:43   0.1s Bash: echo hi > made_by_bash.txt && sed -i 's/alpha/ALPHA/' notes.txt
         ↳ A:made_by_bash.txt(+1/-0) M:notes.txt(+1/-1)
-        ⚠ Bash ha modificato 2 file: made_by_bash.txt, notes.txt
+        ⚠ Bash modified 2 files: made_by_bash.txt, notes.txt
   ✓ #5   10:02:43   0.0s Edit: app.py
-        ⚠ Edit riuscito ma app.py non è cambiato sul disco
-  ✎ 10:02:43        modificati fuori da Claude: notes.txt(+1/-0)
+        ⚠ Edit succeeded but app.py was not changed on disk
+  ✎ 10:02:43        modified outside Claude: notes.txt(+1/-0)
   ✓ #16  10:02:44   0.1s Edit: app.py
-        ⚠ app.py riportato a una versione precedente: annulla il lavoro dal passo 6
+        ⚠ app.py reverted to a previous version: undoing work from step 6
 ```
 
-## Perché
+## Why
 
-Il transcript di Claude Code dice cosa l'agente *voleva* fare. Gli hook dicono *quando* l'ha fatto.
-Solo il disco dice cosa è *successo davvero*: un `sed -i` dentro un comando Bash, un file creato e poi
-cancellato, una Edit che risulta riuscita ma non cambia nulla, una modifica fatta da te tra un turno e l'altro.
+Claude Code's transcript tells you what the agent *intended* to do. Hooks tell you *when* it happened. Only the filesystem tells you what *actually happened*: a `sed -i` command inside Bash, a file created and then deleted, an Edit that reports success but changes nothing, or a modification you made between turns.
 
-flightrec incrocia le tre fonti, unite per `session_id` + `tool_use_id`:
+flightrec correlates these three sources using `session_id` + `tool_use_id`:
 
-| Fonte | Cosa fornisce |
+| Source | What it provides |
 |---|---|
-| Transcript di Claude Code | intenzione (testo e ragionamento prima dell'azione), input, risultato |
-| Hook `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | orari precisi, durata, esito |
-| Foto del progetto in un git separato | diff reale di ogni azione, anche di quelle fatte via Bash |
+| Claude Code transcript | Intent (text and reasoning before the action), input, and result |
+| `PreToolUse` / `PostToolUse` / `PostToolUseFailure` hooks | Precise timestamps, duration, and outcome |
+| Project snapshots stored in a separate Git repository | Actual diffs for every action, including those performed through Bash |
 
-## Installazione
+## Installation
 
-Requisiti: `bash`, `jq`, `git`, `python3` (3.8+). Nessuna dipendenza Python.
+Requirements: `bash`, `jq`, `git`, `python3` (3.8+). No Python dependencies.
 
-Dentro Claude Code:
+Inside Claude Code:
 
-```
+```bash
 /plugin marketplace add donerrico99/flightrec
 /plugin install flightrec@flightrec
 ```
 
-Oppure, per provarlo senza installarlo: `claude --plugin-dir /percorso/flightrec`.
+Alternatively, try it without installing:
 
-Da quel momento ogni sessione nel progetto viene registrata in `.claude/flightrec/`.
-Aggiungi questa riga al `.gitignore` del progetto:
-
+```bash
+claude --plugin-dir /path/to/flightrec
 ```
+
+From that point on, every session in the project is recorded under `.claude/flightrec/`.
+
+Add the following line to your project's `.gitignore`:
+
+```gitignore
 .claude/flightrec/
 ```
 
-## Uso
+## Usage
 
+```bash
+/flightrec:report                                       # inside Claude Code: generate the report
+python3 <plugin>/bin/flightrec build                    # generate report.html + flightrec.db in .claude/flightrec/
+python3 <plugin>/bin/flightrec sessions                 # list recorded sessions
+python3 <plugin>/bin/flightrec timeline [SESSION] -v    # print the timeline (-v also shows what Claude said)
+python3 <plugin>/bin/flightrec diff <tool_use_id>       # show the actual diff for a single action
+python3 <plugin>/bin/flightrec findings                 # show findings only
 ```
-/flightrec:report                                       # dentro Claude Code: genera il report
-python3 <plugin>/bin/flightrec build                    # report.html + flightrec.db in .claude/flightrec/
-python3 <plugin>/bin/flightrec sessions                 # elenco sessioni
-python3 <plugin>/bin/flightrec timeline [SESSIONE] -v   # cronologia nel terminale (con -v anche cosa ha detto)
-python3 <plugin>/bin/flightrec diff <tool_use_id>       # diff reale di una singola azione
-python3 <plugin>/bin/flightrec findings                 # solo le segnalazioni
-```
 
-Funziona anche sulle sessioni registrate **prima** di installare flightrec: legge lo storico di Claude Code
-(`~/.claude/projects/`), ma in quel caso gli effetti sui file sono quelli dichiarati nel transcript e
-il report li segna come *non verificati*.
+flightrec also works with sessions recorded **before** installation: it reads Claude Code's history from `~/.claude/projects/`. In this case, however, file changes are based on what the transcript reports rather than independently verified filesystem snapshots, and the report explicitly marks them as *unverified*.
 
-## Segnalazioni
+## Findings
 
-Tutte prodotte da regole fisse, ognuna con le prove (id delle chiamate, file, passi):
+All findings are generated using deterministic rules, each backed by evidence (call IDs, files, and steps):
 
-| Tipo | Quando |
+| Type | When it is triggered |
 |---|---|
-| `tool_error` | un tool è fallito |
-| `identical_retry` / `retry_loop` | stesso tool con input identico dopo un errore (3+ volte = loop) |
-| `no_effect` | Edit/Write riuscito ma il file sul disco non è cambiato |
-| `indirect_change` | un comando Bash (o altro tool) ha modificato file |
-| `side_effect` | una Edit ha cambiato anche file diversi da quello dichiarato |
-| `error_with_changes` | un'azione risulta fallita ma ha cambiato file |
-| `reverted` | un file torna a una versione precedente della sessione (lavoro annullato), o viene eliminato dopo essere stato creato |
-| `repeated_read` | lo stesso file letto 3 volte senza modifiche in mezzo |
-| `external_change` | file cambiati fuori dalle azioni di Claude (tu, l'editor, un altro processo) |
-| `shared_attribution` | file cambiati mentre giravano chiamate parallele |
-| `slow` | azione oltre 60 secondi |
-| `interrupted`, `denied`, `no_result`, `user_interrupt` | interruzioni e permessi negati |
+| `tool_error` | A tool call fails |
+| `identical_retry` / `retry_loop` | The same tool is called again with identical input after an error (3+ consecutive retries = loop) |
+| `no_effect` | An Edit/Write succeeds, but the file on disk remains unchanged |
+| `indirect_change` | A Bash command (or another tool) modifies files |
+| `side_effect` | An Edit also modifies files other than the one explicitly targeted |
+| `error_with_changes` | An action reports failure but still modifies files |
+| `reverted` | A file returns to a previous version from the same session (work is undone), or is deleted after being created |
+| `repeated_read` | The same file is read 3 times without any intervening modifications |
+| `external_change` | Files are modified outside Claude's actions (by you, an editor, or another process) |
+| `shared_attribution` | Files are modified while parallel tool calls are running |
+| `slow` | An action takes longer than 60 seconds |
+| `interrupted`, `denied`, `no_result`, `user_interrupt` | Interruptions and permission denials |
 
-## Cosa salva e dove
+## What gets stored and where
 
-```
+```text
 .claude/flightrec/
-  events.jsonl        un evento per riga (payload completo degli hook)
-  snapshots.git/      foto del progetto (git separato, deduplicato e compresso)
-  transcripts/        copia dei transcript, così sopravvivono alla pulizia dei 30 giorni
-  report.html         generato da `flightrec build`
-  flightrec.db        idem: tabelle sessions, prompts, calls, file_changes, external_changes, findings
+  events.jsonl        one event per line (complete hook payload)
+  snapshots.git/      project snapshots (separate Git repository, deduplicated and compressed)
+  transcripts/        transcript copies, preserved beyond Claude Code's 30-day cleanup period
+  report.html         generated by `flightrec build`
+  flightrec.db        generated by `flightrec build`: sessions, prompts, calls,
+                      file_changes, external_changes, and findings tables
 ```
 
-- Le foto rispettano il `.gitignore` del progetto ed escludono di default `node_modules/`, `.venv/`,
-  `__pycache__/` e simili. Altre esclusioni in `.flightrecignore` (stessa sintassi del `.gitignore`).
-- Il git del tuo progetto non viene mai toccato.
-- Le foto si fanno solo per i tool che possono modificare file e a inizio/fine turno; Read, Grep,
-  Glob e simili registrano solo l'evento. L'output dei tool di sola lettura non viene duplicato
-  (è già nel transcript); `FLIGHTREC_KEEP_READ_OUTPUT=1` per salvarlo comunque.
+- Snapshots respect your project's `.gitignore` and exclude `node_modules/`, `.venv/`, `__pycache__/`, and similar directories by default. Additional exclusions can be configured in `.flightrecignore` (using the same syntax as `.gitignore`).
+- Your project's Git repository is never touched.
+- Snapshots are created only for tools that can modify files and at the beginning/end of each turn. Read, Grep, Glob, and similar tools only generate events. Read-only tool output is not duplicated (it is already available in the transcript); set `FLIGHTREC_KEEP_READ_OUTPUT=1` to store it anyway.
 
-**Privacy.** Tutto resta in locale. I file contengono ciò che contiene il tuo progetto e ciò che Claude
-ha letto e scritto: non committare `.claude/flightrec/`.
+**Privacy.** Everything stays local. The files contain whatever your project contains, as well as what Claude has read and written. Do not commit `.claude/flightrec/`.
 
-## Prestazioni
+## Performance
 
-Misurate su un repository di 2.200 file (37 MB): prima foto 1,5 s, poi circa 30 ms per azione;
-Read e simili circa 15 ms. Il hook non scrive mai su stdout e non blocca mai Claude: se qualcosa va storto
-esce in silenzio.
+Benchmarked on a repository containing 2,200 files (37 MB): the initial snapshot takes 1.5 seconds, subsequent snapshots take approximately 30 ms per action, and Read-like operations take approximately 15 ms.
 
-## Variabili d'ambiente
+Hooks never write to stdout and never block Claude Code: if anything goes wrong, they fail silently.
 
-| Variabile | Effetto |
+## Environment variables
+
+| Variable | Effect |
 |---|---|
-| `FLIGHTREC_DISABLE=1` | non registra nulla |
-| `FLIGHTREC_SNAPSHOT=0` | solo eventi, nessuna foto del disco |
-| `FLIGHTREC_DIR` | cartella dei dati (default `.claude/flightrec`) |
-| `FLIGHTREC_KEEP_READ_OUTPUT=1` | salva anche l'output dei tool di sola lettura |
+| `FLIGHTREC_DISABLE=1` | Disable recording entirely |
+| `FLIGHTREC_SNAPSHOT=0` | Record events only, without filesystem snapshots |
+| `FLIGHTREC_DIR` | Data directory (default: `.claude/flightrec`) |
+| `FLIGHTREC_KEEP_READ_OUTPUT=1` | Also store the output of read-only tools |
 
-## Limiti noti
+## Known limitations
 
-- Con chiamate parallele le modifiche avvenute nello stesso intervallo sono attribuite a tutte
-  (segnalato come `shared_attribution`).
-- I processi lanciati in background da Bash che modificano file dopo la fine del comando vengono
-  rilevati come `external_change` al passo successivo.
-- I file ignorati dal `.gitignore` non vengono fotografati: le loro modifiche non compaiono.
+- With parallel calls, modifications occurring within the same time window are attributed to all overlapping calls (reported as `shared_attribution`).
+- Background processes launched by Bash that modify files after the command has finished are detected as `external_change` at the next step.
+- Files ignored by `.gitignore` are not included in snapshots, so changes to them are not detected.
 
-## Test
+## Tests
 
-```
+```bash
 tests/run_all.sh
 ```
 
-Il test di scenario esegue il vero hook su un progetto temporaneo simulando una sessione completa
-(errori, retry, effetti di Bash, chiamate parallele, modifiche esterne, lavoro annullato) e verifica
-ogni segnalazione. Il test del parser usa un transcript reale di Claude Code 2.1.319.
+The scenario test runs the actual hook against a temporary project, simulating a complete session (errors, retries, Bash side effects, parallel calls, external modifications, and reverted work) and verifies every finding.
 
-## Licenza
+The parser test uses a real Claude Code 2.1.319 transcript.
+
+## License
 
 MIT
